@@ -1,0 +1,17 @@
+{
+  "name": "Meridian Blueprint",
+  "version": "0.1.0",
+  "main": "meridian.blueprint.BlueprintModule",
+  "priority": 100,
+  "updateUrl": "https://github.com/hyspy-dev/meridian-blueprint/releases",
+  "dependsOn": {
+    "meridian-core": ">=0.2.0"
+  },
+  "requires": {
+    "services": [
+      "meridian.core.api.World",
+      "meridian.core.api.DebugRender",
+      "meridian.core.api.WorldState"
+    ]
+  }
+}

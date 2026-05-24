@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>meridian</groupId>
+    <artifactId>meridian-blueprint</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+
+    <!-- Litematica-like blueprint preview. Layer-1 (Jedi) — sends the same
+         ShowTriggerVolumePastePrefabPreview the server's built-in paste tool
+         uses, so the ghost-block rendering is the client's native one. No
+         custom 3D rendering, no asset shipping; we hand the client a
+         BlockChange[] and it draws.
+
+         Capture side reuses the SelectionTool reply packet: when the player
+         copies an area with the in-game tool, the server announces clipboard
+         contents in BuilderToolSelectionToolReplyWithClipboard — we observe
+         that, keep BlockChange[] in memory, optionally persist to a
+         server-compatible .prefab.json (BSON v8) file. -->
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>meridian</groupId>
+            <artifactId>meridian-api</artifactId>
+            <version>1.0.0-SNAPSHOT</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Jedi opt-in: ShowTriggerVolumePastePrefabPreview, ReplyWithClipboard, etc. -->
+        <dependency>
+            <groupId>meridian</groupId>
+            <artifactId>meridian-protocol</artifactId>
+            <version>1.0.0-SNAPSHOT</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- World / BlockView for read-side block resolution (name <-> id). -->
+        <dependency>
+            <groupId>meridian</groupId>
+            <artifactId>meridian-core-api</artifactId>
+            <version>0.1.0-SNAPSHOT</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>4.1.100.Final</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>2.0.9</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Gson is bundled by the proxy host (com.google.gson 2.10.1) — we
+             reach it as 'provided' so the shaded plugin jar stays small. -->
+        <dependency>
+            <groupId>com.google.gson</groupId>
+            <artifactId>gson</artifactId>
+            <version>2.10.1</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
