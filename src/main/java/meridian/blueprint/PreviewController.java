@@ -10,6 +10,7 @@ import java.util.concurrent.ScheduledFuture;
 import meridian.api.module.Scheduler;
 import meridian.api.session.ProxySession;
 import meridian.core.api.Block;
+import meridian.core.api.BlockPos;
 import meridian.core.api.DebugRender;
 import meridian.core.api.Player;
 import meridian.core.api.Vec3;
@@ -56,10 +57,38 @@ final class PreviewController {
      *  next repaint, and idle ticks emit zero packets either way. */
     private static final Duration DIFF_TICK = Duration.ofMillis(1000);
 
+    /** Cap on captured selection volume — guards against accidental
+     *  whole-world drags. 50 000 blocks ≈ a 37×37×37 room. */
+    private static final int MAX_SELECTION_BLOCKS = 50_000;
+
+    /** Through-wall {@code worldBox} ids for the selection visualisation.
+     *  Stable names so {@code addOrUpdate} replaces the previous shape on
+     *  every refresh instead of stacking new ones. */
+    private static final String VIEW_ID_AABB = "bp_selection_aabb";
+    private static final String VIEW_ID_P1   = "bp_selection_p1";
+    private static final String VIEW_ID_P2   = "bp_selection_p2";
+    /** Stable id for the live aim-debug overlay (one cube on the block the
+     *  player is currently looking at). Lets the toggle clear it cleanly. */
+    private static final String VIEW_ID_AIM_DEBUG = "bp_aim_debug";
+    /** Cadence of the aim-debug overlay refresh. 300 ms feels responsive
+     *  while keeping the wire load to ~3 packets/sec when enabled. */
+    private static final Duration AIM_DEBUG_TICK = Duration.ofMillis(300);
+    /** Default raycast reach for the corner-picker. The settings slider
+     *  overrides this — pick something further when fitting buildings,
+     *  closer when the camera keeps catching unintended blocks behind the
+     *  one you actually want. */
+    private static final double DEFAULT_PICK_RANGE = 7.0;
+
+    /** User-tunable raycast reach passed to {@link Player#lookedAtBlock(double)}.
+     *  Volatile because the settings callback runs on the EDT while the
+     *  corner-pick reads from the scheduler thread. */
+    private volatile double pickRange = DEFAULT_PICK_RANGE;
+
     private final Logger log;
     private final World world;
     private final DebugRender debug;
     private final BlockNameResolver names;
+    private final SelectionStore selection = new SelectionStore();
     private volatile ProxySession session;
     /** True once we've already warned about a missing session — keeps the log quiet on repeat clicks. */
     private volatile boolean warnedNoSession;
@@ -180,6 +209,271 @@ final class PreviewController {
 
     boolean isActive() {
         return painter != null;
+    }
+
+    // ------------------------------------------------------------------
+    // Selection — crosshair-driven, no spoof
+    // ------------------------------------------------------------------
+
+    /**
+     * Records the block the player is currently looking at as corner 1.
+     * Uses the proxy's own voxel raycast — {@link InteractionControl#targetedBlock}
+     * only updates when the player actually clicks the mouse, which would
+     * require breaking / using the block to set a corner. Raycasting from
+     * the player's eye along their look vector finds the first solid block
+     * without any interaction, just like the in-game crosshair would.
+     */
+    void setCornerOneFromCrosshair() {
+        Optional<BlockPos> hit = lookedAtBlock();
+        if (hit.isEmpty()) {
+            log.warn("no block under crosshair (no player / no orientation / out of range)");
+            return;
+        }
+        selection.setP1(hit.get());
+        log.info("corner 1 = ({},{},{})", hit.get().x(), hit.get().y(), hit.get().z());
+        refreshSelectionView();
+    }
+
+    /** Same as {@link #setCornerOneFromCrosshair} but for the second corner. */
+    void setCornerTwoFromCrosshair() {
+        Optional<BlockPos> hit = lookedAtBlock();
+        if (hit.isEmpty()) {
+            log.warn("no block under crosshair (no player / no orientation / out of range)");
+            return;
+        }
+        selection.setP2(hit.get());
+        log.info("corner 2 = ({},{},{})", hit.get().x(), hit.get().y(), hit.get().z());
+        refreshSelectionView();
+    }
+
+    /** Sets the raycast reach used by the corner picker and the aim-debug
+     *  overlay. Clamped to {@code >= 1} to keep zero-range probes from
+     *  silently failing. */
+    void setPickRange(int blocks) {
+        pickRange = Math.max(1, blocks);
+    }
+
+    /** Helper — fetches the looked-at block through the core service.
+     *  Centralises the "no player yet" guard so the corner setters and
+     *  the debug overlay share the same null-checks. */
+    private Optional<BlockPos> lookedAtBlock() {
+        return world.player().flatMap(p -> p.lookedAtBlock(pickRange));
+    }
+
+    /**
+     * DDA voxel traversal from the player's eye along their look direction.
+     * Returns the first non-air block hit, or empty if nothing solid sits
+     * inside {@link #RAY_MAX_DIST}.
+     *
+     * <p>The DDA is the standard "Amanatides &amp; Woo" algorithm — at every
+     * step we advance to the next voxel boundary along whichever axis has
+     * the smallest {@code tMax}, and check whether the new cell is solid.
+     */
+    // ------------------------------------------------------------------
+    // Live aim-debug overlay — toggled from settings; emits a worldBox at
+    // the currently-looked-at block every 300 ms so the player sees the
+    // raycast result in real time and can verify it points where they
+    // expect (great for diagnosing axis-sign / eye-height issues).
+    // ------------------------------------------------------------------
+
+    /** Handle to the 300 ms aim-debug repaint task; null when toggled off. */
+    private volatile ScheduledFuture<?> aimDebugHandle;
+
+    /**
+     * Turns the aim-debug overlay on or off. When on, a scheduled tick
+     * every {@link #AIM_DEBUG_TICK} reads {@code Player.lookedAtBlock} and
+     * re-emits a stable-id {@code worldBox} on the result. When off, the
+     * task is cancelled and the box cleared.
+     */
+    void setAimDebug(boolean enabled, Scheduler scheduler) {
+        ScheduledFuture<?> h = aimDebugHandle;
+        if (enabled) {
+            if (h != null) return;                     // already on
+            aimDebugHandle = scheduler.scheduleAtFixedRate(this::tickAimDebug,
+                    AIM_DEBUG_TICK, AIM_DEBUG_TICK);
+            log.info("aim-debug overlay ON");
+        } else {
+            if (h != null) {
+                h.cancel(false);
+                aimDebugHandle = null;
+            }
+            debug.clearWorldBox(VIEW_ID_AIM_DEBUG);
+            log.info("aim-debug overlay OFF");
+        }
+    }
+
+    private void tickAimDebug() {
+        Optional<BlockPos> hit = lookedAtBlock();
+        if (hit.isEmpty()) {
+            // Don't clear here — we'd flicker every time the raycast misses
+            // air between solids. The shape's id stability keeps the last
+            // known target visible until a new one is found.
+            return;
+        }
+        BlockPos p = hit.get();
+        // 1.02 inflate to overpower the world block's faces visibly; bright
+        // green so it stands out from the magenta / yellow corner markers.
+        debug.worldBox(VIEW_ID_AIM_DEBUG,
+                p.x() + 0.5, p.y() + 0.5, p.z() + 0.5,
+                1.02, 1.02, 1.02,
+                0.2f, 1.0f, 0.4f, 0.55f);
+    }
+
+    /**
+     * Writes the current selection as a {@code .prefab.json} into
+     * {@code prefabsDir}. Air voxels are skipped; the file is named
+     * {@code <name>.prefab.json} after sanitisation. The library picks
+     * the new file up on its next scan and it appears in the LiveList.
+     */
+    void saveSelectionAs(Path prefabsDir, String name) {
+        Optional<SelectionStore.Box> bOpt = selection.box();
+        if (bOpt.isEmpty()) {
+            log.warn("save aborted — selection incomplete, set both corners first");
+            return;
+        }
+        if (name == null || name.isBlank()) {
+            log.warn("save aborted — prefab name is empty");
+            return;
+        }
+        SelectionStore.Box b = bOpt.get();
+        if (b.blockCount() > MAX_SELECTION_BLOCKS) {
+            log.warn("save aborted — selection too large ({} blocks, cap {})",
+                    b.blockCount(), MAX_SELECTION_BLOCKS);
+            return;
+        }
+        try {
+            int blocks = PrefabSaver.save(world, b, prefabsDir, name.trim());
+            log.info("saved {} blocks → {}/{}.prefab.json", blocks, prefabsDir, name.trim());
+        } catch (IOException e) {
+            log.warn("save failed", e);
+        }
+    }
+
+    /** Wipes both corners and the on-screen visualisation. */
+    void clearSelection() {
+        selection.clear();
+        debug.clearWorldBox(VIEW_ID_AABB);
+        debug.clearWorldBox(VIEW_ID_P1);
+        debug.clearWorldBox(VIEW_ID_P2);
+        log.info("selection cleared");
+    }
+
+    /**
+     * Re-emits the through-wall selection visualisation. Three shapes:
+     * a translucent cyan AABB spanning whatever corners are set, plus a
+     * pair of bright opaque cubes pinpointing P1 (magenta) and P2 (yellow).
+     * The AABB stays low-opacity so the blocks inside still read; corner
+     * markers are saturated so the player sees exactly which voxel each
+     * pick landed on.
+     *
+     * <p>Each shape has a stable id so successive calls replace the
+     * previous shape in place — no flicker, no de-duping concerns.
+     */
+    private void refreshSelectionView() {
+        Optional<BlockPos> a = selection.p1(), c = selection.p2();
+        if (a.isPresent()) {
+            BlockPos p = a.get();
+            // 1.01 inflate over the unit cube so the marker edges don't
+            // z-fight the world block we just picked.
+            debug.worldBox(VIEW_ID_P1,
+                    p.x() + 0.5, p.y() + 0.5, p.z() + 0.5,
+                    1.01, 1.01, 1.01,
+                    1.0f, 0.2f, 1.0f, 0.6f);   // magenta, fairly opaque
+        }
+        if (c.isPresent()) {
+            BlockPos p = c.get();
+            debug.worldBox(VIEW_ID_P2,
+                    p.x() + 0.5, p.y() + 0.5, p.z() + 0.5,
+                    1.01, 1.01, 1.01,
+                    1.0f, 0.9f, 0.2f, 0.6f);   // yellow, fairly opaque
+        }
+        selection.box().ifPresent(b -> {
+            // Centre on the AABB; full dimensions are the box edge lengths.
+            double cx = (b.xMin() + b.xMax() + 1) / 2.0;
+            double cy = (b.yMin() + b.yMax() + 1) / 2.0;
+            double cz = (b.zMin() + b.zMax() + 1) / 2.0;
+            debug.worldBox(VIEW_ID_AABB, cx, cy, cz,
+                    b.sizeX(), b.sizeY(), b.sizeZ(),
+                    0.3f, 0.85f, 1.0f, 0.18f);  // soft cyan, low opacity
+        });
+    }
+
+    /**
+     * Scans the world inside the selection box, builds a blueprint, and
+     * starts a preview anchored on the box's min corner. Behaviour mirrors
+     * {@link #loadAndStart} once the blueprint exists — same paste-style
+     * base + diff overlay.
+     */
+    void captureSelection(Scheduler scheduler) {
+        ProxySession s = requireSession();
+        if (s == null) return;
+        Optional<SelectionStore.Box> bOpt = selection.box();
+        if (bOpt.isEmpty()) {
+            log.warn("selection incomplete — set both corners first");
+            return;
+        }
+        SelectionStore.Box b = bOpt.get();
+        int volume = b.blockCount();
+        if (volume > MAX_SELECTION_BLOCKS) {
+            log.warn("selection too large ({} blocks, cap {})", volume, MAX_SELECTION_BLOCKS);
+            return;
+        }
+
+        int[] dx = new int[volume], dy = new int[volume], dz = new int[volume], ids = new int[volume];
+        byte[] rot = new byte[volume];
+        int i = 0;
+        for (int y = b.yMin(); y <= b.yMax(); y++) {
+            for (int z = b.zMin(); z <= b.zMax(); z++) {
+                for (int x = b.xMin(); x <= b.xMax(); x++) {
+                    Block blk = world.blockAt(x, y, z);
+                    int id = blk != null && blk.type() != null ? blk.type().id() : 0;
+                    if (id <= 0) continue;             // skip air
+                    dx[i] = x - b.xMin();
+                    dy[i] = y - b.yMin();
+                    dz[i] = z - b.zMin();
+                    ids[i] = id;
+                    rot[i] = 0;
+                    i++;
+                }
+            }
+        }
+        if (i == 0) {
+            log.warn("selection contains no solid blocks");
+            return;
+        }
+        Blueprint bp = new Blueprint(b.xMin(), b.yMin(), b.zMin(),
+                trim(dx, i), trim(dy, i), trim(dz, i), trim(ids, i), trim(rot, i));
+        startBlueprint(s, scheduler, bp,
+                "selection (" + i + "/" + volume + " blocks, "
+                        + b.sizeX() + "x" + b.sizeY() + "x" + b.sizeZ() + ")");
+    }
+
+    /** Status string for the settings liveText. */
+    String selectionStatus() {
+        Optional<BlockPos> a = selection.p1(), c = selection.p2();
+        if (a.isEmpty() && c.isEmpty()) return "no corners set";
+        if (a.isEmpty()) return "corner 1 not set";
+        if (c.isEmpty()) return "corner 2 not set (P1 = " + fmt(a.get()) + ")";
+        return selection.box().map(b -> b.sizeX() + "x" + b.sizeY() + "x" + b.sizeZ()
+                + " (" + b.blockCount() + " blocks)").orElse("");
+    }
+
+    private static String fmt(BlockPos p) {
+        return p.x() + "," + p.y() + "," + p.z();
+    }
+
+    private static int[] trim(int[] src, int len) {
+        if (len == src.length) return src;
+        int[] out = new int[len];
+        System.arraycopy(src, 0, out, 0, len);
+        return out;
+    }
+
+    private static byte[] trim(byte[] src, int len) {
+        if (len == src.length) return src;
+        byte[] out = new byte[len];
+        System.arraycopy(src, 0, out, 0, len);
+        return out;
     }
 
     // ------------------------------------------------------------------

@@ -36,6 +36,11 @@ public class BlueprintModule implements ProxyModule {
     /** How often the data directory is rescanned for new prefab files. */
     private static final Duration LIBRARY_REFRESH = Duration.ofSeconds(5);
 
+    /** Latest text in the "Prefab name" field. Session-only — the field
+     *  itself isn't persistent because a saved-and-cleared name shouldn't
+     *  re-appear next launch. */
+    private volatile String draftPrefabName = "";
+
     @Override
     public void onEnable(ModuleContext ctx) {
         Logger log = ctx.getLogger();
@@ -82,6 +87,22 @@ public class BlueprintModule implements ProxyModule {
                 .button("Preview sanity cube",
                         () -> preview.startSanityPreview(scheduler))
                 .button("Hide preview", preview::hide)
+                // ───── Capture selection (crosshair-driven) ─────
+                .liveText("Selection", preview::selectionStatus)
+                .int_("pickRange", "Crosshair reach (blocks)", 1, 256, 7, preview::setPickRange)
+                    .persistent()
+                .bool("aimDebug", "Live aim-debug overlay (green cube on looked-at block)",
+                        false, v -> preview.setAimDebug(v, scheduler))
+                .button("Set corner 1 (looked-at block)",
+                        preview::setCornerOneFromCrosshair)
+                .button("Set corner 2 (looked-at block)",
+                        preview::setCornerTwoFromCrosshair)
+                .string("prefabName", "Prefab name", "", v -> draftPrefabName = v)
+                .button("Save selection as prefab",
+                        () -> preview.saveSelectionAs(ctx.getDataDir(), draftPrefabName))
+                .button("Preview selection (no save)",
+                        () -> preview.captureSelection(scheduler))
+                .button("Clear selection", preview::clearSelection)
                 .build());
 
         log.info("enabled — live diff overlay, {} listed prefab(s) at boot",
