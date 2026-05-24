@@ -6,6 +6,7 @@ import meridian.api.module.ProxyModule;
 import meridian.api.module.Scheduler;
 import meridian.api.packet.Direction;
 import meridian.api.packet.HandlerPosition;
+import meridian.api.settings.SettingBinding;
 import meridian.api.settings.SettingsSpec;
 import meridian.core.api.DebugRender;
 import meridian.core.api.World;
@@ -14,27 +15,21 @@ import org.slf4j.Logger;
 
 /**
  * meridian-blueprint — Litematica-style schematic preview for the Meridian
- * proxy. Combines two client-native rendering pipes:
+ * proxy. The preview pipeline has two layers:
  *
  * <ul>
- *   <li>{@code ShowTriggerVolumePastePrefabPreview} draws the textured base
- *       — the same packet the server's paste tool uses, so the blueprint
- *       reads as a normal block render.</li>
- *   <li>{@link DebugRender#box} draws the diff overlay — depth-tested,
- *       semi-transparent debug cubes on top of the base. Repainted every
- *       500 ms so colours match the live world (cyan = missing, orange =
- *       wrong type, hidden when correct).</li>
+ *   <li>{@code ShowTriggerVolumePastePrefabPreview} draws a textured base —
+ *       the same packet the server's paste tool uses, so the blueprint
+ *       reads as a regular block render.</li>
+ *   <li>{@code DisplayDebug} cubes drawn on top of the base form the diff
+ *       overlay — depth-tested, opacity 0.3, cyan for missing / orange for
+ *       wrong / nothing for correct. The painter rescans the world at 1 Hz
+ *       and pushes a single repaint only when a cell actually changes.</li>
  * </ul>
  *
- * <p>The settings panel exposes a live list of {@code .prefab.json} files
- * found in the module's data directory; clicking a row pastes that prefab
- * under the player's feet and starts the diff loop. Files are rescanned in
- * the background every 5 seconds, so dropping a new file makes it appear in
- * the list without restarting the proxy.
- *
- * <p>A "Preview sanity cube" button stays as a self-test path that doesn't
- * need disk state — useful when the block catalog is still loading or no
- * prefab is on hand.
+ * <p>Layer slicing — for big prefabs the panel exposes a window size and
+ * Prev/Next/jump-to-layer controls. The painter and the paste-preview both
+ * filter to the same window so the overlay stays aligned with the texture.
  */
 public class BlueprintModule implements ProxyModule {
 
@@ -52,24 +47,38 @@ public class BlueprintModule implements ProxyModule {
         BlockNameResolver names = new BlockNameResolver(worldState);
         PreviewController preview = new PreviewController(log, world, debug, names);
 
-        // Default-channel observer captures the ProxySession so the preview
-        // controller has a pipe back to the client. MONITOR — observe-only.
         ctx.registerHandler(Direction.BOTH, HandlerPosition.MONITOR,
                 (direction, session) -> new SessionObserver(preview));
 
-        // The proxy owns and auto-creates this directory on first reference.
-        // We never touch the working directory — that can be anywhere.
         PrefabLibrary library = new PrefabLibrary(log, ctx.getDataDir());
         log.info("prefabs dir = {}", ctx.getDataDir().toAbsolutePath());
-        // First scan synchronously so the live list isn't empty if the user
-        // opens the panel within the first 5 seconds.
         library.refresh();
         scheduler.scheduleAtFixedRate(library::refresh, LIBRARY_REFRESH, LIBRARY_REFRESH);
+
+        // The layer input is a string field because the proxy's SettingBinding
+        // only supports .string today (see docs/settings.md). Prev / Next
+        // buttons push the new value through the binding so the widget stays
+        // in sync; clicks in the field itself parse the text and apply.
+        SettingBinding<String> layerBinding = new SettingBinding<>();
 
         ctx.registerSettings(SettingsSpec.builder()
                 .liveList("Prefabs (click to preview)",
                         library::rows,
                         idx -> onPrefabClicked(ctx, preview, library, idx))
+                .liveText("Status", preview::statusLine)
+                .liveText("Layers", preview::layerLine)
+                .int_("layerWindow", "Layers shown (0 = all)", 0, 256, 0, preview::setWindow)
+                    .persistent()
+                .button("◀ Prev layer", () -> {
+                    int newLayer = preview.shiftLayer(-1);
+                    layerBinding.set(Integer.toString(newLayer));
+                })
+                .string("layer", "Jump to layer", "0",
+                        v -> setLayerFromText(preview, v), layerBinding)
+                .button("Next layer ▶", () -> {
+                    int newLayer = preview.shiftLayer(+1);
+                    layerBinding.set(Integer.toString(newLayer));
+                })
                 .button("Preview sanity cube",
                         () -> preview.startSanityPreview(scheduler))
                 .button("Hide preview", preview::hide)
@@ -79,16 +88,21 @@ public class BlueprintModule implements ProxyModule {
                 library.rows().size());
     }
 
-    /**
-     * Live-list click handler. Fires on the EDT, so the actual disk read +
-     * resolve + packet build is bounced to {@code offloadExecutor()}. The
-     * snapshot pattern in {@link PrefabLibrary} guarantees the index points
-     * at the same row the user saw.
-     */
     private static void onPrefabClicked(ModuleContext ctx, PreviewController preview,
                                         PrefabLibrary library, int idx) {
         library.pathAt(idx).ifPresent(path ->
                 ctx.offloadExecutor().execute(() ->
                         preview.loadAndStart(ctx.scheduler(), path)));
+    }
+
+    /** Parse-and-apply with a forgiving rule — blank or garbage input is ignored. */
+    private static void setLayerFromText(PreviewController preview, String v) {
+        if (v == null || v.isBlank()) return;
+        try {
+            preview.setLayer(Integer.parseInt(v.trim()));
+        } catch (NumberFormatException ignored) {
+            // Field accepts arbitrary text; the proxy's text widget saves on
+            // focus loss, so transient typing isn't worth a log line.
+        }
     }
 }

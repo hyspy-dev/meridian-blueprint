@@ -10,8 +10,8 @@
   "requires": {
     "services": [
       "meridian.core.api.World",
-      "meridian.core.api.DebugRender",
-      "meridian.core.api.WorldState"
+      "meridian.core.api.WorldState",
+      "meridian.core.api.DebugRender"
     ]
   }
 }
