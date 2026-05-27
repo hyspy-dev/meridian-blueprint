@@ -58,8 +58,10 @@ final class PreviewController {
     private static final Duration DIFF_TICK = Duration.ofMillis(1000);
 
     /** Cap on captured selection volume — guards against accidental
-     *  whole-world drags. 50 000 blocks ≈ a 37×37×37 room. */
-    private static final int MAX_SELECTION_BLOCKS = 50_000;
+     *  whole-world drags. 5 000 000 blocks ≈ a 171×171×171 room; the
+     *  cap is on the raw AABB volume (air included), so a hollow shell
+     *  this size still passes through. */
+    private static final int MAX_SELECTION_BLOCKS = 5_000_000;
 
     /** Through-wall {@code worldBox} ids for the selection visualisation.
      *  Stable names so {@code addOrUpdate} replaces the previous shape on
