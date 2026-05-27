@@ -507,6 +507,42 @@ final class PreviewController {
         return currentLayer;
     }
 
+    /**
+     * Translates the active preview by {@code (dx,dy,dz)} world blocks.
+     * Rebuilds the blueprint with a shifted anchor (cell arrays are shared by
+     * reference — same memory, just a new anchor) and swaps in a fresh
+     * painter wired to it. The layer window is preserved.
+     *
+     * <p>No-op when nothing is showing.
+     */
+    void shiftPreview(int dx, int dy, int dz) {
+        ProxySession s = session;
+        DiffPainter oldPainter = painter;
+        Blueprint bp = activeBlueprint;
+        if (s == null || oldPainter == null || bp == null) {
+            log.warn("move ignored — no active preview");
+            return;
+        }
+        if (dx == 0 && dy == 0 && dz == 0) return;
+
+        Blueprint shifted = new Blueprint(
+                bp.anchorX + dx, bp.anchorY + dy, bp.anchorZ + dz,
+                bp.dx, bp.dy, bp.dz, bp.blockId, bp.rotation);
+        DiffPainter p = new DiffPainter(log, world, debug, shifted);
+        if (windowSize > 0) {
+            currentLayer = clampLayer(currentLayer, p);
+            p.setWindow(currentLayer, windowSize);
+        }
+        // Wipe the old painter's debug cubes; selection markers (worldBox)
+        // live on a different packet path and survive this call.
+        oldPainter.clearShapes();
+        painter = p;
+        activeBlueprint = shifted;
+        s.sendToClient(new HideTriggerVolumePastePrefabPreview());
+        sendPastePreview(s, shifted, p.windowLo(), p.windowHi());
+        p.tick();
+    }
+
     // ------------------------------------------------------------------
     // Status (for liveText)
     // ------------------------------------------------------------------

@@ -41,6 +41,10 @@ public class BlueprintModule implements ProxyModule {
      *  re-appear next launch. */
     private volatile String draftPrefabName = "";
 
+    /** Step size, in blocks, for the Move-preview buttons. Persistent so
+     *  the user's dialled-in increment survives restarts. */
+    private volatile int moveStep = 1;
+
     @Override
     public void onEnable(ModuleContext ctx) {
         Logger log = ctx.getLogger();
@@ -87,6 +91,16 @@ public class BlueprintModule implements ProxyModule {
                 .button("Preview sanity cube",
                         () -> preview.startSanityPreview(scheduler))
                 .button("Hide preview", preview::hide)
+                .section("Move preview", SettingsSpec.builder()
+                        .int_("moveStep", "Step (blocks)", 1, 256, 1, v -> moveStep = v)
+                            .persistent()
+                        .button("◀ West (X-)",  () -> preview.shiftPreview(-moveStep, 0, 0))
+                        .button("East (X+) ▶",  () -> preview.shiftPreview(+moveStep, 0, 0))
+                        .button("▲ North (Z-)", () -> preview.shiftPreview(0, 0, -moveStep))
+                        .button("▼ South (Z+)", () -> preview.shiftPreview(0, 0, +moveStep))
+                        .button("↑ Up (Y+)",    () -> preview.shiftPreview(0, +moveStep, 0))
+                        .button("↓ Down (Y-)",  () -> preview.shiftPreview(0, -moveStep, 0))
+                        .build())
                 // ───── Capture selection (crosshair-driven) ─────
                 .liveText("Selection", preview::selectionStatus)
                 .int_("pickRange", "Crosshair reach (blocks)", 1, 256, 7, preview::setPickRange)
