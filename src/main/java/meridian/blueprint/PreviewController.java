@@ -516,19 +516,97 @@ final class PreviewController {
      * <p>No-op when nothing is showing.
      */
     void shiftPreview(int dx, int dy, int dz) {
-        ProxySession s = session;
-        DiffPainter oldPainter = painter;
         Blueprint bp = activeBlueprint;
-        if (s == null || oldPainter == null || bp == null) {
+        if (bp == null) {
             log.warn("move ignored — no active preview");
             return;
         }
         if (dx == 0 && dy == 0 && dz == 0) return;
 
-        Blueprint shifted = new Blueprint(
+        swapInBlueprint(new Blueprint(
                 bp.anchorX + dx, bp.anchorY + dy, bp.anchorZ + dz,
-                bp.dx, bp.dy, bp.dz, bp.blockId, bp.rotation);
-        DiffPainter p = new DiffPainter(log, world, debug, shifted);
+                bp.dx, bp.dy, bp.dz, bp.blockId, bp.rotation));
+    }
+
+    /**
+     * Rotates the active preview 90° CCW around the given axis (right-hand
+     * rule: thumb points along the axis, fingers curl in the rotation
+     * direction). {@code axis} — 0 = X (pitch), 1 = Y (yaw), 2 = Z (roll).
+     * Geometry only — per-block rotation states (stairs, doors) are not
+     * adjusted, so a rotated stair will still face its original direction.
+     * Click four times to come back to where you started.
+     *
+     * <p>Cells are re-normalised to non-negative offsets after the rotation,
+     * with the difference folded into the anchor so world positions are
+     * unchanged at the moment of transform.
+     */
+    void rotatePreview(int axis) {
+        transformPreview(axis, false);
+    }
+
+    /**
+     * Mirrors the active preview across the plane perpendicular to the given
+     * axis. {@code axis} — 0 = X, 1 = Y, 2 = Z. Geometry only (per-block
+     * rotation states not adjusted).
+     */
+    void mirrorPreview(int axis) {
+        transformPreview(axis, true);
+    }
+
+    private void transformPreview(int axis, boolean mirror) {
+        Blueprint bp = activeBlueprint;
+        if (bp == null) {
+            log.warn("transform ignored — no active preview");
+            return;
+        }
+        if (axis < 0 || axis > 2) return;
+
+        int n = bp.size;
+        int[] nx = new int[n], ny = new int[n], nz = new int[n];
+        for (int i = 0; i < n; i++) {
+            int x = bp.dx[i], y = bp.dy[i], z = bp.dz[i];
+            if (mirror) {
+                nx[i] = (axis == 0) ? -x : x;
+                ny[i] = (axis == 1) ? -y : y;
+                nz[i] = (axis == 2) ? -z : z;
+            } else {
+                switch (axis) {
+                    case 0 -> { nx[i] = x;  ny[i] = -z; nz[i] =  y; }   // around X
+                    case 1 -> { nx[i] = z;  ny[i] =  y; nz[i] = -x; }   // around Y
+                    case 2 -> { nx[i] = -y; ny[i] =  x; nz[i] =  z; }   // around Z
+                }
+            }
+        }
+
+        int minX = 0, minY = 0, minZ = 0;
+        if (n > 0) {
+            minX = nx[0]; minY = ny[0]; minZ = nz[0];
+            for (int i = 1; i < n; i++) {
+                if (nx[i] < minX) minX = nx[i];
+                if (ny[i] < minY) minY = ny[i];
+                if (nz[i] < minZ) minZ = nz[i];
+            }
+            for (int i = 0; i < n; i++) {
+                nx[i] -= minX;
+                ny[i] -= minY;
+                nz[i] -= minZ;
+            }
+        }
+
+        swapInBlueprint(new Blueprint(
+                bp.anchorX + minX, bp.anchorY + minY, bp.anchorZ + minZ,
+                nx, ny, nz, bp.blockId, bp.rotation));
+    }
+
+    /** Replaces the active blueprint with {@code newBp}, rebuilds the
+     *  painter, preserves the layer window, and re-issues the textured
+     *  preview. Shared tail for shift / rotate / mirror. */
+    private void swapInBlueprint(Blueprint newBp) {
+        ProxySession s = session;
+        DiffPainter oldPainter = painter;
+        if (s == null || oldPainter == null) return;
+
+        DiffPainter p = new DiffPainter(log, world, debug, newBp);
         if (windowSize > 0) {
             currentLayer = clampLayer(currentLayer, p);
             p.setWindow(currentLayer, windowSize);
@@ -537,9 +615,9 @@ final class PreviewController {
         // live on a different packet path and survive this call.
         oldPainter.clearShapes();
         painter = p;
-        activeBlueprint = shifted;
+        activeBlueprint = newBp;
         s.sendToClient(new HideTriggerVolumePastePrefabPreview());
-        sendPastePreview(s, shifted, p.windowLo(), p.windowHi());
+        sendPastePreview(s, newBp, p.windowLo(), p.windowHi());
         p.tick();
     }
 
