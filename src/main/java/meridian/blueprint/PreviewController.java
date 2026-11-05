@@ -6,25 +6,24 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledFuture;
 import meridian.api.module.Scheduler;
-import meridian.api.session.ProxySession;
 import meridian.core.api.Block;
 import meridian.core.api.BlockPos;
 import meridian.core.api.DebugRender;
+import java.util.List;
+import meridian.core.api.BuilderSelection;
+import meridian.core.api.PastePreview;
 import meridian.core.api.Player;
 import meridian.core.api.Vec3;
 import meridian.core.api.World;
-import meridian.protocol.packets.interface_.BlockChange;
-import meridian.protocol.packets.player.HideTriggerVolumePastePrefabPreview;
-import meridian.protocol.packets.player.ShowTriggerVolumePastePrefabPreview;
-import org.joml.Vector3f;
 import org.slf4j.Logger;
 
 /**
- * Lifecycle for an active blueprint preview. Holds the {@link ProxySession}
- * captured from observed traffic, owns the scheduler handle for the diff
- * tick, and emits the textured paste-preview at start / on layer change / hide.
+ * Lifecycle for an active blueprint preview. Owns the scheduler handle for the diff tick, and
+ * emits the textured paste-preview at start / on layer change / hide through the core
+ * {@link PastePreview} service - core owns the wire, this owns what is drawn.
  *
  * <p>Everything visual is delegated:
  * <ul>
@@ -36,21 +35,11 @@ import org.slf4j.Logger;
  *
  * <p>Layer slicing: the controller stores user-configured {@code currentLayer}
  * and {@code windowSize}, applies them to both the {@link DiffPainter}
- * (overlay) and the {@link ShowTriggerVolumePastePrefabPreview} payload
- * (textured base). Changing either re-sends paste-preview filtered to the
- * new window, so texture and overlay stay aligned.
+ * (overlay) and the {@link PastePreview} payload (textured base). Changing either re-sends
+ * paste-preview filtered to the new window, so texture and overlay stay aligned.
  */
 final class PreviewController {
 
-    /**
-     * Default biome tint applied to paste previews. Pulled from Hytale's own
-     * builder-tool fallback ({@code PrefabEditSessionManager.DEFAULT_TINT} =
-     * Color(91, 158, 40)). A zero tint makes the shader multiply each
-     * block face by black — the cube renders as an opaque black brick.
-     */
-    private static final int DEFAULT_BIOME_TINT = 0x5B9E28;
-    /** Neutral water tint — only matters for fluid cells in a preview. */
-    private static final int DEFAULT_WATER_TINT = 0x3F76E4;
 
     /** Cadence at which the painter scans the world for changes. 1 Hz is
      *  plenty; players don't place blocks faster than the eye notices the
@@ -91,9 +80,73 @@ final class PreviewController {
     private final DebugRender debug;
     private final BlockNameResolver names;
     private final SelectionStore selection = new SelectionStore();
-    private volatile ProxySession session;
-    /** True once we've already warned about a missing session — keeps the log quiet on repeat clicks. */
-    private volatile boolean warnedNoSession;
+    /** Core owns the wire; this draws the ghost. Null-safe: no client, no-op. */
+    private final PastePreview pastePreview;
+    /** The native area-selection tool, when the line has it; null on 0.5.9, where only the
+     *  crosshair corner-pick exists. */
+    private final BuilderSelection builderSelection;
+    private volatile boolean toolsWired;
+
+    // Our own tools. The client only knows the items its server sent it, so each is declared to core
+    // as a copy of a native builder tool - that gives it an icon and working behaviour - carrying our
+    // id, name and description.
+    private static final String TOOL_LAYERS = "meridian_bp_layers";
+
+    /** What our tool is called, looks like and does. */
+    private static final List<BuilderSelection.ToolSpec> TOOL_SPECS = List.of(
+            new BuilderSelection.ToolSpec(TOOL_LAYERS, BuilderSelection.LAYERS_TOOL,
+                    "Blueprint", "Left click: next layer. Right click: previous layer. F: blueprint panel"));
+
+    /** The blueprint tool's F: layers and preview, as in the module's settings. */
+    private volatile BlueprintPanelWindow panelWindow;
+    /** The selection tool's Use: save the selection as a prefab. */
+    private volatile SavePrefabWindow saveWindow;
+
+    void setWindows(BlueprintPanelWindow panel, SavePrefabWindow save) {
+        panelWindow = panel;
+        saveWindow = save;
+    }
+
+    /** Says something to the player in chat; a no-op until the module wires it. */
+    private volatile java.util.function.Consumer<String> chat = text -> { };
+
+    void setChat(java.util.function.Consumer<String> chat) {
+        this.chat = chat == null ? text -> { } : chat;
+    }
+
+    private void tell(String text) {
+        log.info("tell player: {}", text);
+        chat.accept(text);
+    }
+
+    /** How far a preview moves per step, shared by the settings panel and the in-game one. */
+    private volatile int moveStep = 1;
+
+    int moveStep() {
+        return moveStep;
+    }
+
+    void setMoveStep(int step) {
+        moveStep = Math.max(1, Math.min(256, step));
+    }
+
+    int windowSize() {
+        return windowSize;
+    }
+    /**
+     * What the game's paste tool holds: the blueprint last chosen or selected, its cells relative
+     * to its anchor and unturned. Null until something is chosen.
+     */
+    private volatile Blueprint clipboard;
+    /** The quarter turns given to the paste tool's clipboard since it was loaded, in order: {axis, steps}. */
+    private final List<int[]> clipboardTurns = new CopyOnWriteArrayList<>();
+    /** Whether our tools are up - the paste tool holds our clipboard only while they are. */
+    private volatile boolean blueprinting;
+    /** For the projection a paste puts down; handed over when blueprinting is switched on. */
+    private volatile Scheduler pasteScheduler;
+
+    /** True once we've warned about no client yet - keeps the log quiet on repeat clicks. */
+    private volatile boolean warnedNoClient;
 
     /** Currently-active painter, or {@code null} when nothing is shown. */
     private volatile DiffPainter painter;
@@ -109,18 +162,183 @@ final class PreviewController {
     /** Number of layers shown; 0 = no limit (show the whole stack). */
     private volatile int windowSize;
 
-    PreviewController(Logger log, World world, DebugRender debug, BlockNameResolver names) {
+    /** The paste tool's prefab list (its E key), when core can open windows. */
+    private volatile PrefabListWindow prefabList;
+
+    void setPrefabList(PrefabListWindow window) {
+        prefabList = window;
+    }
+
+    PreviewController(Logger log, World world, DebugRender debug, BlockNameResolver names,
+                      PastePreview pastePreview, BuilderSelection builderSelection) {
         this.log = log;
         this.world = world;
         this.debug = debug;
         this.names = names;
+        this.pastePreview = pastePreview;
+        this.builderSelection = builderSelection;
     }
 
-    void bindSession(ProxySession s) {
-        if (this.session == null) {
-            this.session = s;
-            log.info("bound Default-channel session");
+    /** Whether the native in-game selection tool can be offered - the 0.6 line and later. */
+    boolean hasBuilderTools() {
+        return builderSelection != null;
+    }
+
+    /**
+     * Shows or hides the native in-game selection tool.
+     *
+     * <p>When on, the player drags a box with the real tool and it fills both corners at once -
+     * no crosshair picking. The box the client reports is read by core and dropped before the
+     * server sees it, so it is only ever a selection, never an edit. The crosshair pick still
+     * works alongside, for anyone who prefers it.
+     */
+    void setBlueprinting(boolean on, Scheduler scheduler) {
+        if (builderSelection == null) {
+            log.warn("builder tools are not available on this server line");
+            return;
         }
+        pasteScheduler = scheduler;
+        blueprinting = on;
+        if (on && !toolsWired) {
+            // The selection tool's drag fills the box, as before.
+            builderSelection.onSelection(box -> {
+                // Just remember it - the client already draws the selection box itself, so we do
+                // not paint our own.
+                selection.setP1(new BlockPos(box.xMin(), box.yMin(), box.zMin()));
+                selection.setP2(new BlockPos(box.xMax(), box.yMax(), box.zMax()));
+                log.info("selection = ({},{},{}) .. ({},{},{})",
+                        box.xMin(), box.yMin(), box.zMin(), box.xMax(), box.yMax(), box.zMax());
+            });
+            // F on any of our tools comes back here. For now we only say which - the popups that
+            // each opens are the next step; this is the round-trip we are proving first.
+            builderSelection.onTool(this::onTool);
+            // The game's own paste tool, holding our blueprint: it follows the cursor and turns on
+            // its usual keys by itself; we only hear the turns and where it was pasted.
+            builderSelection.onPaste(new BuilderSelection.PasteListener() {
+                @Override public void turned(BuilderSelection.Axis axis, int degrees) {
+                    clipboardTurns.add(new int[] {axis.ordinal(), Math.floorMod(degrees / 90, 4)});
+                    log.info("paste tool turned {} by {}", axis, degrees);
+                    // The client spun its preview and waits for the turned clipboard, as the
+                    // server would send it.
+                    Blueprint base = clipboard;
+                    if (base != null) {
+                        builderSelection.confirmTurn(changesOf(
+                                PreviewController.turned(base, clipboardTurns, 0, 0, 0)));
+                    }
+                }
+                @Override public void flipped(BuilderSelection.Axis axis) {
+                    clipboardTurns.add(new int[] {axis.ordinal(), FLIP});
+                    log.info("paste tool flipped across {}", axis);
+                    Blueprint base = clipboard;
+                    if (base != null) {
+                        builderSelection.confirmTurn(changesOf(
+                                PreviewController.turned(base, clipboardTurns, 0, 0, 0)));
+                    }
+                }
+                @Override public void copyAsked() {
+                    copySelection();
+                }
+                @Override public void listAsked() {
+                    PrefabListWindow window = prefabList;
+                    if (window != null) {
+                        window.open();
+                    } else {
+                        log.info("paste tool asked for the prefab list - no window on this core");
+                    }
+                }
+                @Override public void reset() {
+                    clipboardTurns.clear();
+                    log.info("paste tool turns reset");
+                    builderSelection.setClipboard(clipboardChanges());
+                }
+                @Override public void pasted(int x, int y, int z) {
+                    placeClipboard(x, y, z);
+                }
+            });
+            builderSelection.defineTools(TOOL_SPECS);   // teach the client our items
+            toolsWired = true;
+        }
+        builderSelection.setClipboard(on ? clipboardChanges() : null);
+        builderSelection.forceTools(on
+                ? List.of(
+                        BuilderSelection.SELECTION_TOOL,   // slot 0: outline a selection
+                        BuilderSelection.PASTE_TOOL,       // slot 1: place a projection
+                        TOOL_LAYERS)                       // slot 2: layers, and the panel on F
+                : List.of());
+        log.info("blueprinting {}", on ? "on - tools forced into the toolbar" : "off - tools cleared");
+    }
+
+    /**
+     * The player acted on a tool: the blueprint tool steps layers on its clicks and opens the
+     * panel on F; Use on the selection tool offers to save what is selected.
+     */
+    private void onTool(String toolId, BuilderSelection.Interaction kind) {
+        String name = BuilderSelection.SELECTION_TOOL.equals(toolId) ? "SELECTION"
+                : BuilderSelection.PASTE_TOOL.equals(toolId) ? "PASTE"
+                : TOOL_LAYERS.equals(toolId) ? "BLUEPRINT" : toolId;
+        log.info("{} on {} tool", kind, name);
+        if (TOOL_LAYERS.equals(toolId)) {
+            switch (kind) {
+                case PRIMARY -> stepLayer(+1);
+                case SECONDARY -> stepLayer(-1);
+                case USE -> {
+                    BlueprintPanelWindow w = panelWindow;
+                    if (w != null) {
+                        w.open();
+                    }
+                }
+                default -> { }
+            }
+        } else if (BuilderSelection.SELECTION_TOOL.equals(toolId) && kind == BuilderSelection.Interaction.USE) {
+            SavePrefabWindow w = saveWindow;
+            if (w != null) {
+                w.open();
+            }
+        }
+    }
+
+    /**
+     * One layer up or down, wrapping past either end - with a window of one layer when none was
+     * set, since stepping through "all of them" would show nothing change.
+     *
+     * @return the layer now at the bottom of the window, or null with no projection up
+     */
+    Integer stepLayer(int direction) {
+        DiffPainter p = painter;
+        if (p == null) {
+            return null;
+        }
+        if (windowSize <= 0) {
+            setWindow(1);
+        }
+        int next = currentLayer + direction;
+        if (next > p.maxLayer()) {
+            next = p.minLayer();
+        } else if (next < p.minLayer()) {
+            next = p.maxLayer();
+        }
+        shiftLayer(next - currentLayer);
+        log.info("layer {} of {}..{}", currentLayer, p.minLayer(), p.maxLayer());
+        return currentLayer;
+    }
+
+    /**
+     * A ghost straight from the selection, nothing saved: the selection goes into the paste tool -
+     * the copy key, and the selection window's "Copy to buffer". Off the calling thread, since a
+     * big selection is many block reads.
+     */
+    void copySelection() {
+        Scheduler s = pasteScheduler;
+        if (!hasSelection()) {
+            tell("Select an area first.");
+        } else if (s != null) {
+            s.schedule(() -> captureSelection(s), Duration.ZERO);
+        }
+    }
+
+    /** Whether both corners of a selection are set. */
+    boolean hasSelection() {
+        return selection.box().isPresent();
     }
 
     // ------------------------------------------------------------------
@@ -130,11 +348,10 @@ final class PreviewController {
     /**
      * Drops a 3×3×3 sanity cube of whatever block the player is standing on.
      * Used as a self-test for the preview pipeline — no disk, no catalog
-     * lookup, only needs an active session and a known player position.
+     * lookup, only needs a client and a known player position.
      */
     void startSanityPreview(Scheduler scheduler) {
-        ProxySession s = requireSession();
-        if (s == null) return;
+        if (!requireReady()) return;
         Optional<Vec3> pos = playerPosition();
         if (pos.isEmpty()) return;
         int ox = (int) Math.floor(pos.get().x());
@@ -143,7 +360,7 @@ final class PreviewController {
         int blockId = sampleStandingBlockId(ox, oy - 1, oz);
 
         Blueprint bp = BlueprintBuilder.sanityCube(ox, oy, oz, blockId);
-        startBlueprint(s, scheduler, bp, "sanity cube (blockId=" + blockId + ")");
+        startBlueprint(scheduler, bp, "sanity cube (blockId=" + blockId + ")");
     }
 
     /**
@@ -153,8 +370,45 @@ final class PreviewController {
      * authoring offsets.
      */
     void loadAndStart(Scheduler scheduler, Path prefabPath) {
-        ProxySession s = requireSession();
-        if (s == null) return;
+        loadAndStartAt(scheduler, prefabPath);
+    }
+
+    /**
+     * A {@code .prefab.json} as a blueprint anchored at the origin - its blocks relative to the
+     * file's anchor, unknown block names left out. Reads the whole file: keep it off the network
+     * thread.
+     */
+    Optional<Blueprint> readPrefab(Path prefabPath) {
+        PrefabFile prefab;
+        try {
+            prefab = PrefabLoader.load(prefabPath);
+        } catch (IOException e) {
+            log.warn("failed to read prefab {}", prefabPath, e);
+            return Optional.empty();
+        }
+        BlueprintBuilder.Result result = BlueprintBuilder.fromPrefab(prefab, names, 0, 0, 0);
+        if (!result.unknownNames().isEmpty()) {
+            log.warn("skipped {} unique unknown block types: {}",
+                    result.unknownNames().size(), result.unknownNames());
+        }
+        return result.blueprint().size == 0 ? Optional.empty() : Optional.of(result.blueprint());
+    }
+
+    /** Puts a prefab file into the paste tool - the prefab list's Load. */
+    void loadPrefabIntoPasteTool(Path prefabPath) {
+        Optional<Blueprint> bp = readPrefab(prefabPath);
+        if (bp.isEmpty()) {
+            log.warn("prefab {} has no usable blocks", prefabPath);
+            return;
+        }
+        String label = prefabPath.getFileName() + " (" + bp.get().size + " blocks)";
+        if (!loadIntoPasteTool(bp.get(), label)) {
+            log.info("{} not loaded - blueprinting is off", label);
+        }
+    }
+
+    private void loadAndStartAt(Scheduler scheduler, Path prefabPath) {
+        if (!requireReady()) return;
         Optional<Vec3> pos = playerPosition();
         if (pos.isEmpty()) return;
 
@@ -181,9 +435,12 @@ final class PreviewController {
             log.warn("prefab {} has no usable blocks after resolution", prefabPath);
             return;
         }
-        startBlueprint(s, scheduler, result.blueprint(),
-                prefabPath.getFileName() + " (" + result.blueprint().size + " blocks, "
-                        + result.skippedEmpty() + " Empty skipped)");
+        String label = prefabPath.getFileName() + " (" + result.blueprint().size + " blocks, "
+                + result.skippedEmpty() + " Empty skipped)";
+        if (loadIntoPasteTool(result.blueprint(), label)) {
+            return;
+        }
+        startBlueprint(scheduler, result.blueprint(), label);
     }
 
     /**
@@ -196,10 +453,9 @@ final class PreviewController {
             h.cancel(false);
             tickHandle = null;
         }
-        ProxySession s = session;
         DiffPainter p = painter;
-        if (s != null && p != null) {
-            s.sendToClient(new HideTriggerVolumePastePrefabPreview());
+        if (p != null) {
+            pastePreview.hide();
             p.clearShapes();
         }
         painter = null;
@@ -328,26 +584,38 @@ final class PreviewController {
      * the new file up on its next scan and it appears in the LiveList.
      */
     void saveSelectionAs(Path prefabsDir, String name) {
+        saveSelection(prefabsDir, name);
+    }
+
+    /**
+     * {@link #saveSelectionAs}, saying how it went.
+     *
+     * @return the blocks written, or a sentence why nothing was
+     */
+    Object saveSelection(Path prefabsDir, String name) {
         Optional<SelectionStore.Box> bOpt = selection.box();
         if (bOpt.isEmpty()) {
             log.warn("save aborted — selection incomplete, set both corners first");
-            return;
+            return "Select an area first";
         }
         if (name == null || name.isBlank()) {
             log.warn("save aborted — prefab name is empty");
-            return;
+            return "The name is empty";
         }
         SelectionStore.Box b = bOpt.get();
         if (b.blockCount() > MAX_SELECTION_BLOCKS) {
             log.warn("save aborted — selection too large ({} blocks, cap {})",
                     b.blockCount(), MAX_SELECTION_BLOCKS);
-            return;
+            return "The selection is too large (" + b.blockCount() + " blocks, at most "
+                    + MAX_SELECTION_BLOCKS + ")";
         }
         try {
             int blocks = PrefabSaver.save(world, b, prefabsDir, name.trim());
             log.info("saved {} blocks → {}/{}.prefab.json", blocks, prefabsDir, name.trim());
+            return blocks;
         } catch (IOException e) {
             log.warn("save failed", e);
+            return "Saving failed: " + e.getMessage();
         }
     }
 
@@ -407,17 +675,18 @@ final class PreviewController {
      * base + diff overlay.
      */
     void captureSelection(Scheduler scheduler) {
-        ProxySession s = requireSession();
-        if (s == null) return;
+        if (!requireReady()) return;
         Optional<SelectionStore.Box> bOpt = selection.box();
         if (bOpt.isEmpty()) {
             log.warn("selection incomplete — set both corners first");
+            tell("Select an area first.");
             return;
         }
         SelectionStore.Box b = bOpt.get();
         int volume = b.blockCount();
         if (volume > MAX_SELECTION_BLOCKS) {
             log.warn("selection too large ({} blocks, cap {})", volume, MAX_SELECTION_BLOCKS);
+            tell("The selection is too large (" + volume + " blocks, at most " + MAX_SELECTION_BLOCKS + ").");
             return;
         }
 
@@ -434,7 +703,7 @@ final class PreviewController {
                     dy[i] = y - b.yMin();
                     dz[i] = z - b.zMin();
                     ids[i] = id;
-                    rot[i] = 0;
+                    rot[i] = (byte) blk.rotation();
                     i++;
                 }
             }
@@ -445,9 +714,12 @@ final class PreviewController {
         }
         Blueprint bp = new Blueprint(b.xMin(), b.yMin(), b.zMin(),
                 trim(dx, i), trim(dy, i), trim(dz, i), trim(ids, i), trim(rot, i));
-        startBlueprint(s, scheduler, bp,
-                "selection (" + i + "/" + volume + " blocks, "
-                        + b.sizeX() + "x" + b.sizeY() + "x" + b.sizeZ() + ")");
+        String label = "selection (" + i + "/" + volume + " blocks, "
+                + b.sizeX() + "x" + b.sizeY() + "x" + b.sizeZ() + ")";
+        if (loadIntoPasteTool(bp, label)) {
+            return;
+        }
+        startBlueprint(scheduler, bp, label);
     }
 
     /** Status string for the settings liveText. */
@@ -532,8 +804,8 @@ final class PreviewController {
      * Rotates the active preview 90° CCW around the given axis (right-hand
      * rule: thumb points along the axis, fingers curl in the rotation
      * direction). {@code axis} — 0 = X (pitch), 1 = Y (yaw), 2 = Z (roll).
-     * Geometry only — per-block rotation states (stairs, doors) are not
-     * adjusted, so a rotated stair will still face its original direction.
+     * Every block turns with it - a stair keeps facing the same way relative
+     * to the building, the way the server turns a pasted selection.
      * Click four times to come back to where you started.
      *
      * <p>Cells are re-normalised to non-negative offsets after the rotation,
@@ -546,8 +818,8 @@ final class PreviewController {
 
     /**
      * Mirrors the active preview across the plane perpendicular to the given
-     * axis. {@code axis} — 0 = X, 1 = Y, 2 = Z. Geometry only (per-block
-     * rotation states not adjusted).
+     * axis. {@code axis} — 0 = X, 1 = Y, 2 = Z. Every block is mirrored with
+     * it, as the server mirrors a symmetric block (see {@link BlockRotations#mirror}).
      */
     void mirrorPreview(int axis) {
         transformPreview(axis, true);
@@ -563,8 +835,11 @@ final class PreviewController {
 
         int n = bp.size;
         int[] nx = new int[n], ny = new int[n], nz = new int[n];
+        byte[] nr = new byte[n];
         for (int i = 0; i < n; i++) {
             int x = bp.dx[i], y = bp.dy[i], z = bp.dz[i];
+            int r = bp.rotation[i] & 0xFF;
+            nr[i] = (byte) (mirror ? BlockRotations.mirror(r, axis) : BlockRotations.rotate(r, axis));
             if (mirror) {
                 nx[i] = (axis == 0) ? -x : x;
                 ny[i] = (axis == 1) ? -y : y;
@@ -595,18 +870,17 @@ final class PreviewController {
 
         swapInBlueprint(new Blueprint(
                 bp.anchorX + minX, bp.anchorY + minY, bp.anchorZ + minZ,
-                nx, ny, nz, bp.blockId, bp.rotation));
+                nx, ny, nz, bp.blockId, nr));
     }
 
     /** Replaces the active blueprint with {@code newBp}, rebuilds the
      *  painter, preserves the layer window, and re-issues the textured
      *  preview. Shared tail for shift / rotate / mirror. */
     private void swapInBlueprint(Blueprint newBp) {
-        ProxySession s = session;
         DiffPainter oldPainter = painter;
-        if (s == null || oldPainter == null) return;
+        if (oldPainter == null) return;
 
-        DiffPainter p = new DiffPainter(log, world, debug, newBp);
+        DiffPainter p = new DiffPainter(log, world, debug, names, newBp);
         if (windowSize > 0) {
             currentLayer = clampLayer(currentLayer, p);
             p.setWindow(currentLayer, windowSize);
@@ -616,8 +890,8 @@ final class PreviewController {
         oldPainter.clearShapes();
         painter = p;
         activeBlueprint = newBp;
-        s.sendToClient(new HideTriggerVolumePastePrefabPreview());
-        sendPastePreview(s, newBp, p.windowLo(), p.windowHi());
+        pastePreview.hide();
+        sendPastePreview(newBp, p.windowLo(), p.windowHi());
         p.tick();
     }
 
@@ -629,7 +903,8 @@ final class PreviewController {
         DiffPainter p = painter;
         if (p == null) return "idle";
         return p.lastCorrect() + " correct / " + p.lastMissing() + " missing / "
-                + p.lastWrong() + " wrong (of " + p.totalCells() + ")";
+                + p.lastWrong() + " wrong / " + p.lastRotated() + " turned wrong (of "
+                + p.totalCells() + ")";
     }
 
     String layerLine() {
@@ -651,9 +926,9 @@ final class PreviewController {
     // Internals
     // ------------------------------------------------------------------
 
-    private void startBlueprint(ProxySession s, Scheduler scheduler, Blueprint bp, String label) {
+    private void startBlueprint(Scheduler scheduler, Blueprint bp, String label) {
         hide();
-        DiffPainter p = new DiffPainter(log, world, debug, bp);
+        DiffPainter p = new DiffPainter(log, world, debug, names, bp);
         // Start with the previously-chosen layer/window if they still make
         // sense; otherwise default to "show everything from the bottom".
         if (windowSize <= 0) {
@@ -664,7 +939,7 @@ final class PreviewController {
         }
         painter = p;
         activeBlueprint = bp;
-        sendPastePreview(s, bp, p.windowLo(), p.windowHi());
+        sendPastePreview(bp, p.windowLo(), p.windowHi());
         p.tick();                                          // first frame, no waiting
         tickHandle = scheduler.scheduleAtFixedRate(this::tickIfActive,
                 DIFF_TICK, DIFF_TICK);
@@ -675,15 +950,14 @@ final class PreviewController {
     private void applyLayerWindow() {
         DiffPainter p = painter;
         Blueprint bp = activeBlueprint;
-        ProxySession s = session;
-        if (p == null || bp == null || s == null) return;
+        if (p == null || bp == null) return;
         currentLayer = clampLayer(currentLayer, p);
         p.setWindow(currentLayer, windowSize);
         // Re-issue the textured base filtered to the active window. The
         // client doesn't merge successive Show packets, so we hide first
         // and re-issue to avoid the old layers lingering underneath.
-        s.sendToClient(new HideTriggerVolumePastePrefabPreview());
-        sendPastePreview(s, bp, p.windowLo(), p.windowHi());
+        pastePreview.hide();
+        sendPastePreview(bp, p.windowLo(), p.windowHi());
         p.tick();    // immediate refresh, don't wait for the next scheduled scan
     }
 
@@ -698,19 +972,120 @@ final class PreviewController {
      * Filters to cells with {@code lo <= dy < hi} so the texture stays in
      * sync with the overlay window.
      */
-    private void sendPastePreview(ProxySession s, Blueprint bp, int lo, int hi) {
-        List<BlockChange> filtered = new ArrayList<>(bp.size);
+    /**
+     * With the tools out, a chosen blueprint goes into the game's paste tool and nowhere else: the
+     * client draws it under the cursor itself, and the projection appears only where it is pasted.
+     * Without the tools - switched off, or a server line that has none - it is drawn at the
+     * player's feet as before.
+     *
+     * @return whether the paste tool took it
+     */
+    private boolean loadIntoPasteTool(Blueprint bp, String label) {
+        loadClipboard(bp);
+        if (builderSelection == null || !blueprinting) {
+            return false;
+        }
+        log.info("{} loaded into the paste tool", label);
+        tell("In the paste tool: " + label);
+        return true;
+    }
+
+    /** Makes {@code bp} what the paste tool holds, unturned, and hands it over if the tools are up. */
+    private void loadClipboard(Blueprint bp) {
+        clipboard = bp;
+        clipboardTurns.clear();
+        if (builderSelection != null && blueprinting) {
+            builderSelection.setClipboard(clipboardChanges());
+        }
+    }
+
+    /** The paste tool's clipboard as blocks relative to its anchor, or null when nothing is chosen. */
+    private List<PastePreview.Change> clipboardChanges() {
+        Blueprint bp = clipboard;
+        return bp == null ? null : changesOf(bp);
+    }
+
+    /** A blueprint's cells as clipboard blocks, relative to its anchor. */
+    static List<PastePreview.Change> changesOf(Blueprint bp) {
+        List<PastePreview.Change> out = new ArrayList<>(bp.size);
+        for (int i = 0; i < bp.size; i++) {
+            out.add(new PastePreview.Change(bp.dx[i], bp.dy[i], bp.dz[i], bp.blockId[i],
+                    bp.rotation[i] & 0xFF));
+        }
+        return out;
+    }
+
+    /**
+     * Puts the projection down where the paste tool pasted: the clipboard turned the way the
+     * player turned it, about its anchor, with the anchor at the pasted block - what the server
+     * would have built there. Nothing reaches the world; the projection is what moves.
+     */
+    private void placeClipboard(int x, int y, int z) {
+        Blueprint base = clipboard;
+        Scheduler scheduler = pasteScheduler;
+        if (base == null || scheduler == null) {
+            log.warn("paste ignored - no blueprint chosen yet");
+            return;
+        }
+        Blueprint placed = turned(base, clipboardTurns, x, y, z);
+        log.info("paste tool pasted at {},{},{} after {} turn(s)", x, y, z, clipboardTurns.size());
+        // Off the network thread: the first scan of a big blueprint reads every one of its blocks.
+        scheduler.schedule(() -> startBlueprint(scheduler, placed, "pasted at " + x + "," + y + "," + z),
+                Duration.ZERO);
+    }
+
+    /** The steps of a {@code clipboardTurns} entry that make it a mirror instead of a turn. */
+    static final int FLIP = -1;
+
+    /**
+     * {@code base} turned by each {@code {axis, quarterSteps}} in order, about its anchor, and
+     * anchored at {@code (x, y, z)}: positions by the server's {@code Axis.rotate}, each block's
+     * facing by {@link BlockRotations#rotate}. An entry of {@link #FLIP} steps mirrors across that
+     * axis through the anchor instead, as the server's {@code Axis.flip}, facings by
+     * {@link BlockRotations#mirror}.
+     */
+    static Blueprint turned(Blueprint base, List<int[]> turns, int x, int y, int z) {
+        int n = base.size;
+        int[] dx = base.dx.clone(), dy = base.dy.clone(), dz = base.dz.clone();
+        byte[] rot = base.rotation.clone();
+        for (int[] turn : turns) {
+            if (turn[1] == FLIP) {
+                for (int i = 0; i < n; i++) {
+                    switch (turn[0]) {
+                        case BlockRotations.X -> dx[i] = -dx[i];
+                        case BlockRotations.Y -> dy[i] = -dy[i];
+                        case BlockRotations.Z -> dz[i] = -dz[i];
+                        default -> throw new IllegalArgumentException("axis " + turn[0]);
+                    }
+                    rot[i] = (byte) BlockRotations.mirror(rot[i] & 0xFF, turn[0]);
+                }
+                continue;
+            }
+            for (int step = 0; step < turn[1]; step++) {
+                for (int i = 0; i < n; i++) {
+                    int cx = dx[i], cy = dy[i], cz = dz[i];
+                    switch (turn[0]) {
+                        case BlockRotations.X -> { dy[i] = -cz; dz[i] = cy; }
+                        case BlockRotations.Y -> { dx[i] = cz; dz[i] = -cx; }
+                        case BlockRotations.Z -> { dx[i] = -cy; dy[i] = cx; }
+                        default -> throw new IllegalArgumentException("axis " + turn[0]);
+                    }
+                    rot[i] = (byte) BlockRotations.rotate(rot[i] & 0xFF, turn[0]);
+                }
+            }
+        }
+        return new Blueprint(x, y, z, dx, dy, dz, base.blockId, rot);
+    }
+
+    private void sendPastePreview(Blueprint bp, int lo, int hi) {
+        List<PastePreview.Change> filtered = new ArrayList<>(bp.size);
         for (int i = 0; i < bp.size; i++) {
             int dy = bp.dy[i];
             if (dy < lo || dy >= hi) continue;
-            filtered.add(new BlockChange(bp.dx[i], dy, bp.dz[i], bp.blockId[i], bp.rotation[i]));
+            filtered.add(new PastePreview.Change(
+                    bp.dx[i], dy, bp.dz[i], bp.blockId[i], bp.rotation[i]));
         }
-        ShowTriggerVolumePastePrefabPreview pkt = new ShowTriggerVolumePastePrefabPreview();
-        pkt.position = new Vector3f(bp.anchorX, bp.anchorY, bp.anchorZ);
-        pkt.blocksChange = filtered.toArray(new BlockChange[0]);
-        pkt.biomeTint = DEFAULT_BIOME_TINT;
-        pkt.waterTint = DEFAULT_WATER_TINT;
-        s.sendToClient(pkt);
+        pastePreview.show(bp.anchorX, bp.anchorY, bp.anchorZ, filtered);
     }
 
     private static int clampLayer(int layer, DiffPainter p) {
@@ -719,13 +1094,16 @@ final class PreviewController {
         return layer;
     }
 
-    private ProxySession requireSession() {
-        ProxySession s = session;
-        if (s == null && !warnedNoSession) {
-            log.warn("no session yet — waiting for first Default-channel packet");
-            warnedNoSession = true;
+    /** Whether there is a client to draw for; warns once while waiting. */
+    private boolean requireReady() {
+        if (pastePreview.isAvailable()) {
+            return true;
         }
-        return s;
+        if (!warnedNoClient) {
+            log.warn("no client yet - waiting for a session");
+            warnedNoClient = true;
+        }
+        return false;
     }
 
     private Optional<Vec3> playerPosition() {

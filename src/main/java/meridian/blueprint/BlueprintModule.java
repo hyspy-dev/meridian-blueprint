@@ -4,11 +4,14 @@ import java.time.Duration;
 import meridian.api.module.ModuleContext;
 import meridian.api.module.ProxyModule;
 import meridian.api.module.Scheduler;
-import meridian.api.packet.Direction;
-import meridian.api.packet.HandlerPosition;
 import meridian.api.settings.SettingBinding;
 import meridian.api.settings.SettingsSpec;
+import meridian.core.api.BuilderSelection;
+import meridian.core.api.Chat;
+import meridian.core.api.ClientAssets;
 import meridian.core.api.DebugRender;
+import meridian.core.api.Pages;
+import meridian.core.api.PastePreview;
 import meridian.core.api.World;
 import meridian.core.api.WorldState;
 import org.slf4j.Logger;
@@ -18,14 +21,18 @@ import org.slf4j.Logger;
  * proxy. The preview pipeline has two layers:
  *
  * <ul>
- *   <li>{@code ShowTriggerVolumePastePrefabPreview} draws a textured base —
- *       the same packet the server's paste tool uses, so the blueprint
- *       reads as a regular block render.</li>
- *   <li>{@code DisplayDebug} cubes drawn on top of the base form the diff
- *       overlay — depth-tested, opacity 0.3, cyan for missing / orange for
- *       wrong / nothing for correct. The painter rescans the world at 1 Hz
- *       and pushes a single repaint only when a cell actually changes.</li>
+ *   <li>Core's {@link PastePreview} draws a textured base — the game's own
+ *       paste ghost, so the blueprint reads as a regular block render, each
+ *       block facing the way the blueprint has it.</li>
+ *   <li>Core's {@link DebugRender} cubes drawn on top of the base form the
+ *       diff overlay — cyan for missing, orange for wrong, yellow for the
+ *       right block facing the wrong way, nothing for correct. The painter
+ *       rescans the world at 1 Hz and repaints only when a cell changes.</li>
  * </ul>
+ *
+ * <p>No protocol types: everything goes through core services, so one jar
+ * serves every game version. The in-game builder tools ({@link BuilderSelection})
+ * are 0.6+ only and simply absent before that.
  *
  * <p>Layer slicing — for big prefabs the panel exposes a window size and
  * Prev/Next/jump-to-layer controls. The painter and the paste-preview both
@@ -41,9 +48,19 @@ public class BlueprintModule implements ProxyModule {
      *  re-appear next launch. */
     private volatile String draftPrefabName = "";
 
-    /** Step size, in blocks, for the Move-preview buttons. Persistent so
-     *  the user's dialled-in increment survives restarts. */
-    private volatile int moveStep = 1;
+    /** A file from the module's jar, or null - logged - when it is not there. */
+    private static byte[] resource(String path, Logger log) {
+        try (java.io.InputStream in = BlueprintModule.class.getResourceAsStream(path)) {
+            if (in == null) {
+                log.warn("missing resource {}", path);
+                return null;
+            }
+            return in.readAllBytes();
+        } catch (java.io.IOException e) {
+            log.warn("cannot read resource {}", path, e);
+            return null;
+        }
+    }
 
     @Override
     public void onEnable(ModuleContext ctx) {
@@ -51,15 +68,41 @@ public class BlueprintModule implements ProxyModule {
         World world = ctx.services().require(World.class);
         WorldState worldState = ctx.services().require(WorldState.class);
         DebugRender debug = ctx.services().require(DebugRender.class);
+        PastePreview pastePreview = ctx.services().require(PastePreview.class);
+        // The native selection tool is a 0.6+ affair; core provides it only where the protocol
+        // can force the tool on. Absent on 0.5.9, and the panel then offers only the crosshair.
+        BuilderSelection builderSelection = ctx.services().get(BuilderSelection.class).orElse(null);
         Scheduler scheduler = ctx.scheduler();
 
         BlockNameResolver names = new BlockNameResolver(worldState);
-        PreviewController preview = new PreviewController(log, world, debug, names);
-
-        ctx.registerHandler(Direction.BOTH, HandlerPosition.MONITOR,
-                (direction, session) -> new SessionObserver(preview));
+        PreviewController preview = new PreviewController(
+                log, world, debug, names, pastePreview, builderSelection);
 
         PrefabLibrary library = new PrefabLibrary(log, ctx.getDataDir());
+        // The paste tool's E opens the game's prefab list; with a core that can open windows we
+        // fill it with our prefabs instead of the server's.
+        Pages pages = ctx.services().get(Pages.class).orElse(null);
+        if (pages != null && builderSelection != null) {
+            preview.setPrefabList(new PrefabListWindow(log, pages, builderSelection, library, preview, scheduler));
+            // The blueprint tool's F opens a document of ours; it rides along with the client's load.
+            ClientAssets assets = ctx.services().get(ClientAssets.class).orElse(null);
+            byte[] panel = resource("/ui/MeridianBlueprintPanel.ui", log);
+            if (assets != null && panel != null) {
+                assets.provideAtConnect(BlueprintPanelWindow.ASSET, panel);
+            }
+            byte[] saveDoc = resource("/ui/MeridianBlueprintSave.ui", log);
+            if (assets != null && saveDoc != null) {
+                assets.provideAtConnect(SavePrefabWindow.OWN_ASSET, saveDoc);
+            }
+            Chat chat = ctx.services().get(Chat.class).orElse(null);
+            if (chat != null) {
+                preview.setChat(text -> chat.send("Blueprint: " + text, "#E8A93B"));
+            }
+            preview.setWindows(
+                    assets != null && panel != null ? new BlueprintPanelWindow(log, pages, assets, chat, preview) : null,
+                    new SavePrefabWindow(log, pages, chat, preview, library, ctx.getDataDir(), scheduler,
+                            saveDoc != null ? assets : null));
+        }
         log.info("prefabs dir = {}", ctx.getDataDir().toAbsolutePath());
         library.refresh();
         scheduler.scheduleAtFixedRate(library::refresh, LIBRARY_REFRESH, LIBRARY_REFRESH);
@@ -71,10 +114,17 @@ public class BlueprintModule implements ProxyModule {
         SettingBinding<String> layerBinding = new SettingBinding<>();
 
         ctx.registerSettings(SettingsSpec.builder()
+                // The one control: put our tools in the toolbar (F on each opens its popup); off
+                // clears the tools but leaves any projections up.
+                .bool("blueprinting",
+                        preview.hasBuilderTools()
+                                ? "Start blueprinting (put our tools in the toolbar)"
+                                : "Blueprinting (needs a 0.6+ server)",
+                        false, on -> preview.setBlueprinting(on, scheduler))
+                .liveText("Status", preview::statusLine)
                 .liveList("Prefabs (click to preview)",
                         library::rows,
                         idx -> onPrefabClicked(ctx, preview, library, idx))
-                .liveText("Status", preview::statusLine)
                 .liveText("Layers", preview::layerLine)
                 .int_("layerWindow", "Layers shown (0 = all)", 0, 256, 0, preview::setWindow)
                     .persistent()
@@ -92,14 +142,14 @@ public class BlueprintModule implements ProxyModule {
                         () -> preview.startSanityPreview(scheduler))
                 .button("Hide preview", preview::hide)
                 .section("Move preview", SettingsSpec.builder()
-                        .int_("moveStep", "Step (blocks)", 1, 256, 1, v -> moveStep = v)
+                        .int_("moveStep", "Step (blocks)", 1, 256, 1, preview::setMoveStep)
                             .persistent()
-                        .button("◀ West (X-)",  () -> preview.shiftPreview(-moveStep, 0, 0))
-                        .button("East (X+) ▶",  () -> preview.shiftPreview(+moveStep, 0, 0))
-                        .button("▲ North (Z-)", () -> preview.shiftPreview(0, 0, -moveStep))
-                        .button("▼ South (Z+)", () -> preview.shiftPreview(0, 0, +moveStep))
-                        .button("↑ Up (Y+)",    () -> preview.shiftPreview(0, +moveStep, 0))
-                        .button("↓ Down (Y-)",  () -> preview.shiftPreview(0, -moveStep, 0))
+                        .button("◀ West (X-)",  () -> preview.shiftPreview(-preview.moveStep(), 0, 0))
+                        .button("East (X+) ▶",  () -> preview.shiftPreview(+preview.moveStep(), 0, 0))
+                        .button("▲ North (Z-)", () -> preview.shiftPreview(0, 0, -preview.moveStep()))
+                        .button("▼ South (Z+)", () -> preview.shiftPreview(0, 0, +preview.moveStep()))
+                        .button("↑ Up (Y+)",    () -> preview.shiftPreview(0, +preview.moveStep(), 0))
+                        .button("↓ Down (Y-)",  () -> preview.shiftPreview(0, -preview.moveStep(), 0))
                         .build())
                 .section("Rotate / mirror preview", SettingsSpec.builder()
                         .button("↻ Rotate X (pitch)", () -> preview.rotatePreview(0))
@@ -109,7 +159,7 @@ public class BlueprintModule implements ProxyModule {
                         .button("⇕ Mirror Y",         () -> preview.mirrorPreview(1))
                         .button("⇆ Mirror Z",         () -> preview.mirrorPreview(2))
                         .build())
-                // ───── Capture selection (crosshair-driven) ─────
+                // ───── Capture selection: the selection tool's box, or two crosshair corners ─────
                 .liveText("Selection", preview::selectionStatus)
                 .int_("pickRange", "Crosshair reach (blocks)", 1, 256, 7, preview::setPickRange)
                     .persistent()

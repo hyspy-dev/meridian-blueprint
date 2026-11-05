@@ -1,0 +1,126 @@
+$C = "../Common.ui";
+$Sounds = "../Sounds.ui";
+
+$C.@PageOverlay #MainPage {
+  LayoutMode: Middle;
+
+  $C.@DecoratedContainer {
+    Anchor: (Width: 460);
+
+    #Title {
+      $C.@Title {
+        @Text = "Blueprint selection";
+      }
+    }
+
+    #Content {
+      LayoutMode: Top;
+      Padding: (Full: 16);
+
+      Label #SizeText {
+        Anchor: (Bottom: 12);
+        Style: $C.@DefaultLabelStyle;
+        Text: "";
+      }
+
+      Group {
+        LayoutMode: Top;
+        Anchor: (Bottom: 16);
+
+        Group {
+          LayoutMode: Left;
+          Anchor: (Bottom: 8);
+
+          Label {
+            Text: "Prefab name";
+            Anchor: (Right: 6);
+            Style: $C.@DefaultLabelStyle;
+          }
+
+          Label #NameRequiredText {
+            Visible: false;
+            Style: (...$C.@DefaultLabelStyle, TextColor: #ff6b6b);
+            Text: "Enter a name";
+          }
+        }
+
+        $C.@TextField #NameInput {
+          PlaceholderText: "my-house";
+        }
+      }
+
+      Group {
+        LayoutMode: Center;
+        Anchor: (Top: 8, Bottom: 8);
+
+        $C.@TextButton #SaveButton {
+          @Sounds = $Sounds.@SaveSettings;
+          @Anchor = (Right: 4);
+          Text: "Save";
+          FlexWeight: 1;
+        }
+
+        $C.@SecondaryTextButton #CopyButton {
+          @Anchor = (Left: 4);
+          Text: "Copy to buffer";
+          FlexWeight: 1;
+        }
+      }
+
+      Group {
+        LayoutMode: Center;
+
+        $C.@SecondaryTextButton #CancelButton {
+          @Sounds = $Sounds.@ButtonsCancel;
+          Text: "Cancel";
+          FlexWeight: 1;
+        }
+      }
+    }
+  }
+}
+
+$C.@PageOverlay #OverwriteConfirmPage {
+  LayoutMode: Middle;
+  Visible: false;
+
+  $C.@DecoratedContainer {
+    Anchor: (Width: 420);
+
+    #Title {
+      $C.@Title {
+        @Text = "Overwrite";
+      }
+    }
+
+    #Content {
+      LayoutMode: Top;
+      Padding: (Full: 24);
+
+      Label #MessageText {
+        Anchor: (Bottom: 24, Horizontal: 8);
+        Style: (...$C.@DefaultLabelStyle, HorizontalAlignment: Center, Wrap: true, FontSize: 16);
+        Text: "";
+      }
+
+      Group {
+        LayoutMode: Center;
+        Anchor: (Top: 8);
+
+        $C.@TextButton #ConfirmOverwriteButton {
+          @Sounds = $Sounds.@SaveSettings;
+          @Anchor = (Right: 4);
+          Text: "Overwrite";
+          FlexWeight: 1;
+        }
+
+        $C.@SecondaryTextButton #CancelOverwriteButton {
+          @Sounds = $Sounds.@ButtonsCancel;
+          @Anchor = (Left: 4);
+          Text: "Back";
+          FlexWeight: 1;
+        }
+      }
+    }
+  }
+}

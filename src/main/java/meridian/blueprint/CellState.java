@@ -12,6 +12,9 @@ package meridian.blueprint;
  *       place this one.</li>
  *   <li>{@link #WRONG} — orange. Something is there but the wrong type;
  *       the player has to mine and replace.</li>
+ *   <li>{@link #ROTATED} — yellow. The right block, facing the wrong way.
+ *       Only for blocks whose facing matters; a different state of the same
+ *       block (an open door, a lit lamp) is {@link #CORRECT}.</li>
  * </ul>
  *
  * <p>The {@code visible} flag is a fast-path the painter checks before
@@ -20,7 +23,8 @@ package meridian.blueprint;
 enum CellState {
     CORRECT(0f, 0f, 0f, false),
     MISSING(0.4f, 0.85f, 1.0f, true),
-    WRONG  (1.0f, 0.55f, 0.1f, true);
+    WRONG  (1.0f, 0.55f, 0.1f, true),
+    ROTATED(1.0f, 0.9f, 0.2f, true);
 
     final float r, g, b;
     final boolean visible;

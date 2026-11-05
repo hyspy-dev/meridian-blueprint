@@ -92,7 +92,7 @@ final class PrefabSaver {
                             y - box.yMin(),
                             z - box.zMin(),
                             typeName,
-                            0));    // rotation unknown from server — write 0
+                            b.rotation()));
                 }
             }
         }
@@ -112,6 +112,12 @@ final class PrefabSaver {
 
     /** Strips characters that would either break the path or clash with the
      *  {@code .prefab.json} suffix the library scans for. */
+    /** The file a prefab saved under {@code name} goes to - to ask before overwriting it. */
+    static Path targetOf(Path dir, String name) {
+        String safe = sanitize(name);
+        return safe.isEmpty() ? null : dir.resolve(safe + ".prefab.json");
+    }
+
     private static String sanitize(String raw) {
         if (raw == null) return "";
         String t = raw.trim();

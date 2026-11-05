@@ -33,12 +33,6 @@
             <scope>provided</scope>
         </dependency>
         <!-- Jedi opt-in: ShowTriggerVolumePastePrefabPreview, ReplyWithClipboard, etc. -->
-        <dependency>
-            <groupId>meridian</groupId>
-            <artifactId>meridian-protocol</artifactId>
-            <version>${meridian.protocol.version}</version>
-            <scope>provided</scope>
-        </dependency>
         <!-- World / BlockView for read-side block resolution (name <-> id). -->
         <dependency>
             <groupId>meridian</groupId>

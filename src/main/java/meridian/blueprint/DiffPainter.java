@@ -32,6 +32,8 @@ final class DiffPainter {
     private final Logger log;
     private final World world;
     private final DebugRender debug;
+    /** Which ids are states of one block, and which blocks' facing counts. */
+    private final BlockNameResolver blocks;
     private final Blueprint bp;
 
     /** Last-tick scan results; index aligned with {@link Blueprint#dx}. */
@@ -48,12 +50,13 @@ final class DiffPainter {
     private volatile int layerHi;
 
     /** Latest counters from the previous tick — exposed for liveText / logging. */
-    private volatile int lastCorrect, lastWrong, lastMissing;
+    private volatile int lastCorrect, lastWrong, lastMissing, lastRotated;
 
-    DiffPainter(Logger log, World world, DebugRender debug, Blueprint bp) {
+    DiffPainter(Logger log, World world, DebugRender debug, BlockNameResolver blocks, Blueprint bp) {
         this.log = log;
         this.world = world;
         this.debug = debug;
+        this.blocks = blocks;
         this.bp = bp;
         this.cached = new CellState[bp.size];
         this.next = new CellState[bp.size];
@@ -79,6 +82,7 @@ final class DiffPainter {
     int lastCorrect()   { return lastCorrect; }
     int lastWrong()     { return lastWrong; }
     int lastMissing()   { return lastMissing; }
+    int lastRotated()   { return lastRotated; }
     int totalCells()    { return bp.size; }
 
     /**
@@ -112,7 +116,8 @@ final class DiffPainter {
      */
     boolean tick() {
         int n = bp.size;
-        int correct = 0, wrong = 0, missing = 0;
+        int correct = 0, wrong = 0, missing = 0, rotated = 0;
+        blocks.refresh();
         boolean changed = false;
         int lo = layerLo, hi = layerHi;
 
@@ -130,12 +135,15 @@ final class DiffPainter {
                         bp.anchorY + dy,
                         bp.anchorZ + bp.dz[i]);
                 int actualId = actual != null && actual.type() != null ? actual.type().id() : 0;
-                if (actualId == bp.blockId[i]) {
-                    ns = CellState.CORRECT; correct++;
-                } else if (actual == null || actual.isAir() || actualId <= 0) {
+                if (actual == null || actual.isAir() || actualId <= 0) {
                     ns = CellState.MISSING; missing++;
-                } else {
+                } else if (!blocks.sameBlock(actualId, bp.blockId[i])) {
                     ns = CellState.WRONG; wrong++;
+                } else if (blocks.rotationMatters(actualId)
+                        && !BlockRotations.same(actual.rotation(), bp.rotation[i] & 0xFF)) {
+                    ns = CellState.ROTATED; rotated++;
+                } else {
+                    ns = CellState.CORRECT; correct++;
                 }
             }
             next[i] = ns;
@@ -144,6 +152,7 @@ final class DiffPainter {
         lastCorrect = correct;
         lastWrong = wrong;
         lastMissing = missing;
+        lastRotated = rotated;
         if (!changed) return false;
 
         // Pass 2 — full repaint. One Clear, one DisplayDebug per visible cell.
@@ -160,8 +169,8 @@ final class DiffPainter {
             emitted++;
         }
         System.arraycopy(next, 0, cached, 0, n);
-        log.debug("repaint — {} correct, {} wrong, {} missing, {} emitted",
-                correct, wrong, missing, emitted);
+        log.debug("repaint — {} correct, {} wrong, {} turned, {} missing, {} emitted",
+                correct, wrong, rotated, missing, emitted);
         return true;
     }
 

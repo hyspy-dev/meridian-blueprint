@@ -23,7 +23,10 @@ final class PrefabFile {
         int z;
         /** Block type id by name (e.g. {@code "Rock_Stone"} or {@code "Empty"}). */
         String name;
-        /** Block rotation (0..7); absent in JSON ⇒ defaults to 0. */
+        /**
+         * Which way the block faces: the server's index 0..63 ({@code roll*16 + pitch*4 + yaw},
+         * each a quarter turn); absent in JSON ⇒ 0, unturned.
+         */
         int rotation;
         /** Hytale's filler bitfield for neighbour-cull hints. Not visualised. */
         int filler;

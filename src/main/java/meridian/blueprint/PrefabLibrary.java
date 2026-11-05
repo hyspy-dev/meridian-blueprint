@@ -46,6 +46,11 @@ final class PrefabLibrary {
         this.dir = dir;
     }
 
+    /** The prefab files of the latest scan, newest first. Safe from any thread. */
+    List<Path> paths() {
+        return snapshot.paths();
+    }
+
     /** Volatile read — safe to call from any thread, including the EDT. */
     List<String> rows() {
         List<String> r = snapshot.rows();
