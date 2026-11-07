@@ -220,20 +220,12 @@ final class PreviewController {
                     log.info("paste tool turned {} by {}", axis, degrees);
                     // The client spun its preview and waits for the turned clipboard, as the
                     // server would send it.
-                    Blueprint base = clipboard;
-                    if (base != null) {
-                        builderSelection.confirmTurn(changesOf(
-                                PreviewController.turned(base, clipboardTurns, 0, 0, 0)));
-                    }
+                    confirmTurned();
                 }
                 @Override public void flipped(BuilderSelection.Axis axis) {
                     clipboardTurns.add(new int[] {axis.ordinal(), FLIP});
                     log.info("paste tool flipped across {}", axis);
-                    Blueprint base = clipboard;
-                    if (base != null) {
-                        builderSelection.confirmTurn(changesOf(
-                                PreviewController.turned(base, clipboardTurns, 0, 0, 0)));
-                    }
+                    confirmTurned();
                 }
                 @Override public void copyAsked() {
                     copySelection();
@@ -249,7 +241,7 @@ final class PreviewController {
                 @Override public void reset() {
                     clipboardTurns.clear();
                     log.info("paste tool turns reset");
-                    builderSelection.setClipboard(clipboardChanges());
+                    builderSelection.setClipboard(clipboardChanges(), clipboardFluidChanges());
                 }
                 @Override public void pasted(int x, int y, int z) {
                     placeClipboard(x, y, z);
@@ -258,7 +250,7 @@ final class PreviewController {
             builderSelection.defineTools(TOOL_SPECS);   // teach the client our items
             toolsWired = true;
         }
-        builderSelection.setClipboard(on ? clipboardChanges() : null);
+        builderSelection.setClipboard(on ? clipboardChanges() : null, on ? clipboardFluidChanges() : null);
         builderSelection.forceTools(on
                 ? List.of(
                         BuilderSelection.SELECTION_TOOL,   // slot 0: outline a selection
@@ -386,7 +378,7 @@ final class PreviewController {
             log.warn("failed to read prefab {}", prefabPath, e);
             return Optional.empty();
         }
-        BlueprintBuilder.Result result = BlueprintBuilder.fromPrefab(prefab, names, 0, 0, 0);
+        BlueprintBuilder.Result result = BlueprintBuilder.fromPrefab(prefab, names, world::fluidId, 0, 0, 0);
         if (!result.unknownNames().isEmpty()) {
             log.warn("skipped {} unique unknown block types: {}",
                     result.unknownNames().size(), result.unknownNames());
@@ -426,7 +418,7 @@ final class PreviewController {
         int ox = (int) Math.floor(pos.get().x());
         int oy = (int) Math.floor(pos.get().y());
         int oz = (int) Math.floor(pos.get().z());
-        BlueprintBuilder.Result result = BlueprintBuilder.fromPrefab(prefab, names, ox, oy, oz);
+        BlueprintBuilder.Result result = BlueprintBuilder.fromPrefab(prefab, names, world::fluidId, ox, oy, oz);
         if (!result.unknownNames().isEmpty()) {
             log.warn("skipped {} unique unknown block types: {}",
                     result.unknownNames().size(), result.unknownNames());
@@ -692,13 +684,17 @@ final class PreviewController {
 
         int[] dx = new int[volume], dy = new int[volume], dz = new int[volume], ids = new int[volume];
         byte[] rot = new byte[volume];
+        FluidCollector wet = new FluidCollector();
         int i = 0;
         for (int y = b.yMin(); y <= b.yMax(); y++) {
             for (int z = b.zMin(); z <= b.zMax(); z++) {
                 for (int x = b.xMin(); x <= b.xMax(); x++) {
+                    wet.add(world.fluidCellAt(x, y, z), x - b.xMin(), y - b.yMin(), z - b.zMin());
                     Block blk = world.blockAt(x, y, z);
                     int id = blk != null && blk.type() != null ? blk.type().id() : 0;
                     if (id <= 0) continue;             // skip air
+                    // A door's or a bed's other cells: placing it on its own cell brings them back.
+                    if (blk.isFiller()) continue;
                     dx[i] = x - b.xMin();
                     dy[i] = y - b.yMin();
                     dz[i] = z - b.zMin();
@@ -713,7 +709,7 @@ final class PreviewController {
             return;
         }
         Blueprint bp = new Blueprint(b.xMin(), b.yMin(), b.zMin(),
-                trim(dx, i), trim(dy, i), trim(dz, i), trim(ids, i), trim(rot, i));
+                trim(dx, i), trim(dy, i), trim(dz, i), trim(ids, i), trim(rot, i), wet.build());
         String label = "selection (" + i + "/" + volume + " blocks, "
                 + b.sizeX() + "x" + b.sizeY() + "x" + b.sizeZ() + ")";
         if (loadIntoPasteTool(bp, label)) {
@@ -797,7 +793,7 @@ final class PreviewController {
 
         swapInBlueprint(new Blueprint(
                 bp.anchorX + dx, bp.anchorY + dy, bp.anchorZ + dz,
-                bp.dx, bp.dy, bp.dz, bp.blockId, bp.rotation));
+                bp.dx, bp.dy, bp.dz, bp.blockId, bp.rotation, bp.fluids));
     }
 
     /**
@@ -853,24 +849,49 @@ final class PreviewController {
             }
         }
 
+        Blueprint.Fluids f = bp.fluids;
+        int m = f.size();
+        int[] fx = new int[m], fy = new int[m], fz = new int[m];
+        for (int i = 0; i < m; i++) {
+            int x = f.dx()[i], y = f.dy()[i], z = f.dz()[i];
+            if (mirror) {
+                fx[i] = (axis == 0) ? -x : x;
+                fy[i] = (axis == 1) ? -y : y;
+                fz[i] = (axis == 2) ? -z : z;
+            } else {
+                switch (axis) {
+                    case 0 -> { fx[i] = x;  fy[i] = -z; fz[i] =  y; }
+                    case 1 -> { fx[i] = z;  fy[i] =  y; fz[i] = -x; }
+                    case 2 -> { fx[i] = -y; fy[i] =  x; fz[i] =  z; }
+                }
+            }
+        }
+
         int minX = 0, minY = 0, minZ = 0;
-        if (n > 0) {
-            minX = nx[0]; minY = ny[0]; minZ = nz[0];
-            for (int i = 1; i < n; i++) {
-                if (nx[i] < minX) minX = nx[i];
-                if (ny[i] < minY) minY = ny[i];
-                if (nz[i] < minZ) minZ = nz[i];
+        if (n + m > 0) {
+            minX = minY = minZ = Integer.MAX_VALUE;
+            for (int i = 0; i < n; i++) {
+                minX = Math.min(minX, nx[i]); minY = Math.min(minY, ny[i]); minZ = Math.min(minZ, nz[i]);
+            }
+            for (int i = 0; i < m; i++) {
+                minX = Math.min(minX, fx[i]); minY = Math.min(minY, fy[i]); minZ = Math.min(minZ, fz[i]);
             }
             for (int i = 0; i < n; i++) {
                 nx[i] -= minX;
                 ny[i] -= minY;
                 nz[i] -= minZ;
             }
+            for (int i = 0; i < m; i++) {
+                fx[i] -= minX;
+                fy[i] -= minY;
+                fz[i] -= minZ;
+            }
         }
 
         swapInBlueprint(new Blueprint(
                 bp.anchorX + minX, bp.anchorY + minY, bp.anchorZ + minZ,
-                nx, ny, nz, bp.blockId, nr));
+                nx, ny, nz, bp.blockId, nr,
+                new Blueprint.Fluids(fx, fy, fz, f.fluidId(), f.level())));
     }
 
     /** Replaces the active blueprint with {@code newBp}, rebuilds the
@@ -995,7 +1016,7 @@ final class PreviewController {
         clipboard = bp;
         clipboardTurns.clear();
         if (builderSelection != null && blueprinting) {
-            builderSelection.setClipboard(clipboardChanges());
+            builderSelection.setClipboard(clipboardChanges(), clipboardFluidChanges());
         }
     }
 
@@ -1003,6 +1024,32 @@ final class PreviewController {
     private List<PastePreview.Change> clipboardChanges() {
         Blueprint bp = clipboard;
         return bp == null ? null : changesOf(bp);
+    }
+
+    /** The paste tool clipboard's fluids, relative to its anchor; empty when nothing is chosen. */
+    private List<PastePreview.FluidChange> clipboardFluidChanges() {
+        Blueprint bp = clipboard;
+        return bp == null ? List.of() : fluidChangesOf(bp);
+    }
+
+    /** The clipboard turned the way the paste tool turned it, handed back as the server would. */
+    private void confirmTurned() {
+        Blueprint base = clipboard;
+        if (base != null && builderSelection != null) {
+            Blueprint turned = PreviewController.turned(base, clipboardTurns, 0, 0, 0);
+            builderSelection.confirmTurn(changesOf(turned), fluidChangesOf(turned));
+        }
+    }
+
+    /** A blueprint's fluid cells as clipboard fluids, relative to its anchor. */
+    static List<PastePreview.FluidChange> fluidChangesOf(Blueprint bp) {
+        Blueprint.Fluids f = bp.fluids;
+        List<PastePreview.FluidChange> out = new ArrayList<>(f.size());
+        for (int i = 0; i < f.size(); i++) {
+            out.add(new PastePreview.FluidChange(f.dx()[i], f.dy()[i], f.dz()[i], f.fluidId()[i],
+                    f.level()[i]));
+        }
+        return out;
     }
 
     /** A blueprint's cells as clipboard blocks, relative to its anchor. */
@@ -1074,7 +1121,33 @@ final class PreviewController {
                 }
             }
         }
-        return new Blueprint(x, y, z, dx, dy, dz, base.blockId, rot);
+        Blueprint.Fluids f = base.fluids;
+        int m = f.size();
+        int[] fx = f.dx().clone(), fy = f.dy().clone(), fz = f.dz().clone();
+        for (int[] turn : turns) {
+            for (int i = 0; i < m; i++) {
+                if (turn[1] == FLIP) {
+                    switch (turn[0]) {
+                        case BlockRotations.X -> fx[i] = -fx[i];
+                        case BlockRotations.Y -> fy[i] = -fy[i];
+                        case BlockRotations.Z -> fz[i] = -fz[i];
+                        default -> throw new IllegalArgumentException("axis " + turn[0]);
+                    }
+                    continue;
+                }
+                for (int step = 0; step < turn[1]; step++) {
+                    int cx = fx[i], cy = fy[i], cz = fz[i];
+                    switch (turn[0]) {
+                        case BlockRotations.X -> { fy[i] = -cz; fz[i] = cy; }
+                        case BlockRotations.Y -> { fx[i] = cz; fz[i] = -cx; }
+                        case BlockRotations.Z -> { fx[i] = -cy; fy[i] = cx; }
+                        default -> throw new IllegalArgumentException("axis " + turn[0]);
+                    }
+                }
+            }
+        }
+        return new Blueprint(x, y, z, dx, dy, dz, base.blockId, rot,
+                new Blueprint.Fluids(fx, fy, fz, f.fluidId(), f.level()));
     }
 
     private void sendPastePreview(Blueprint bp, int lo, int hi) {
@@ -1085,7 +1158,13 @@ final class PreviewController {
             filtered.add(new PastePreview.Change(
                     bp.dx[i], dy, bp.dz[i], bp.blockId[i], bp.rotation[i]));
         }
-        pastePreview.show(bp.anchorX, bp.anchorY, bp.anchorZ, filtered);
+        List<PastePreview.FluidChange> wet = new ArrayList<>();
+        for (PastePreview.FluidChange f : fluidChangesOf(bp)) {
+            if (f.dy() >= lo && f.dy() < hi) {
+                wet.add(f);
+            }
+        }
+        pastePreview.show(bp.anchorX, bp.anchorY, bp.anchorZ, filtered, wet);
     }
 
     private static int clampLayer(int layer, DiffPainter p) {

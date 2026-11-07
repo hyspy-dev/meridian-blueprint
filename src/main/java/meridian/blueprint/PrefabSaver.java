@@ -44,24 +44,42 @@ final class PrefabSaver {
     private PrefabSaver() {}
 
     /** POJO layout fed straight to Gson. Mirrors {@link PrefabFile} but
-     *  drops the loader-only fields we don't write back (support / filler /
+     *  drops the loader-only fields we don't write back (support /
      *  components — server treats absent as default). */
     private static final class Doc {
         int version = VERSION;
         int blockIdVersion = BLOCK_ID_VERSION;
         int anchorX, anchorY, anchorZ;
         List<DocBlock> blocks;
+        /** Water and lava, as the server keeps them: a list beside the blocks; left out when dry. */
+        List<DocFluid> fluids;
+    }
+
+    private static final class DocFluid {
+        int x, y, z;
+        String name;
+        int level;
+
+        DocFluid(int x, int y, int z, String name, int level) {
+            this.x = x; this.y = y; this.z = z;
+            this.name = name;
+            this.level = level;
+        }
     }
 
     private static final class DocBlock {
         int x, y, z;
         String name;
         Integer rotation;       // omitted when 0
+        /** Set on the cells a bigger block only fills, as the server writes them; omitted on a
+         *  block's own cell. A paste - the server's or ours - places the own cell alone. */
+        Integer filler;
 
-        DocBlock(int x, int y, int z, String name, int rotation) {
+        DocBlock(int x, int y, int z, String name, int rotation, int filler) {
             this.x = x; this.y = y; this.z = z;
             this.name = name;
             this.rotation = rotation == 0 ? null : rotation;
+            this.filler = filler == 0 ? null : filler;
         }
     }
 
@@ -80,9 +98,11 @@ final class PrefabSaver {
         Path target = dir.resolve(safe + ".prefab.json");
 
         List<DocBlock> blocks = new ArrayList<>(Math.min(box.blockCount(), 4096));
+        FluidCollector wet = new FluidCollector();
         for (int y = box.yMin(); y <= box.yMax(); y++) {
             for (int z = box.zMin(); z <= box.zMax(); z++) {
                 for (int x = box.xMin(); x <= box.xMax(); x++) {
+                    wet.add(world.fluidCellAt(x, y, z), x - box.xMin(), y - box.yMin(), z - box.zMin());
                     Block b = world.blockAt(x, y, z);
                     if (b == null || b.type() == null || b.isAir()) continue;
                     String typeName = b.type().name();
@@ -92,13 +112,20 @@ final class PrefabSaver {
                             y - box.yMin(),
                             z - box.zMin(),
                             typeName,
-                            b.rotation()));
+                            b.rotation(),
+                            b.filler()));
                 }
             }
         }
 
         Doc doc = new Doc();
         doc.blocks = blocks;
+        if (!wet.cells().isEmpty()) {
+            doc.fluids = new ArrayList<>(wet.cells().size());
+            for (FluidCollector.Cell c : wet.cells()) {
+                doc.fluids.add(new DocFluid(c.x(), c.y(), c.z(), c.name(), c.level()));
+            }
+        }
         // anchor stays (0,0,0) — the file's coords are already local; the
         // server's "anchor" is where the prefab pins to the world on paste,
         // and 0,0,0 is the conventional default ("pin at the local origin").

@@ -28,10 +28,24 @@ final class PrefabFile {
          * each a quarter turn); absent in JSON ⇒ 0, unturned.
          */
         int rotation;
-        /** Hytale's filler bitfield for neighbour-cull hints. Not visualised. */
+        /**
+         * Non-zero on a cell a bigger block (a door, a bed) only reaches into: the packed offset
+         * back to its own cell ({@code Block.filler()} in core). Such cells are not placed.
+         */
         int filler;
         /** Hytale's support indicator. Not visualised. */
         int support;
+    }
+
+    /** One fluid cell - the server keeps fluids in a list of their own, beside the blocks. */
+    static final class Fluid {
+        int x;
+        int y;
+        int z;
+        /** The fluid by name ({@code "Water_Source"}, {@code "Water"}). */
+        String name;
+        /** The server's fill level of the cell. */
+        int level;
     }
 
     int version;
@@ -40,4 +54,6 @@ final class PrefabFile {
     int anchorY;
     int anchorZ;
     List<Block> blocks;
+    /** Absent in a prefab without water or lava. */
+    List<Fluid> fluids;
 }

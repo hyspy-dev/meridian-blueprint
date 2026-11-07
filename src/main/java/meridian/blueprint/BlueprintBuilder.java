@@ -50,12 +50,17 @@ final class BlueprintBuilder {
      * <ul>
      *   <li>{@code "Empty"} cells (Hytale's "no block" marker inside the
      *       prefab format) are dropped silently.</li>
+     *   <li>So are filler cells - the ones a door, a bed or a big chest only
+     *       reaches into. The server skips them on paste too: the block on its
+     *       own cell brings them back, and one placed on them would be a
+     *       second door.</li>
      *   <li>Names the live block catalog doesn't recognise are aggregated
      *       into {@link Result#unknownNames} — the caller logs one line per
      *       unique name instead of one line per dropped block.</li>
      * </ul>
      */
     static Result fromPrefab(PrefabFile prefab, BlockNameResolver names,
+                             java.util.function.ToIntFunction<String> fluidIds,
                              int anchorX, int anchorY, int anchorZ) {
         int max = prefab.blocks.size();
         // Worst-case allocation — trim later. Net memory is small even on
@@ -66,6 +71,9 @@ final class BlueprintBuilder {
         int skippedEmpty = 0;
         int i = 0;
         for (PrefabFile.Block b : prefab.blocks) {
+            if (b.filler != 0) {
+                continue;
+            }
             int id = names.resolve(b.name);
             if (id == 0) {                          // "Empty" marker.
                 skippedEmpty++;
@@ -86,8 +94,37 @@ final class BlueprintBuilder {
         int[] dxT = trim(dx, i), dyT = trim(dy, i), dzT = trim(dz, i), idsT = trim(ids, i);
         byte[] rotT = new byte[i];
         System.arraycopy(rot, 0, rotT, 0, i);
-        Blueprint bp = new Blueprint(anchorX, anchorY, anchorZ, dxT, dyT, dzT, idsT, rotT);
+        Blueprint bp = new Blueprint(anchorX, anchorY, anchorZ, dxT, dyT, dzT, idsT, rotT,
+                fluidsOf(prefab, fluidIds, unknown));
         return new Result(bp, skippedEmpty, unknown);
+    }
+
+    /** The prefab's fluid list as a blueprint's fluid layer; names the catalog lacks go to {@code unknown}. */
+    private static Blueprint.Fluids fluidsOf(PrefabFile prefab, java.util.function.ToIntFunction<String> fluidIds,
+                                             Map<String, Integer> unknown) {
+        if (prefab.fluids == null || prefab.fluids.isEmpty() || fluidIds == null) {
+            return Blueprint.Fluids.NONE;
+        }
+        int max = prefab.fluids.size();
+        int[] dx = new int[max], dy = new int[max], dz = new int[max], ids = new int[max];
+        byte[] level = new byte[max];
+        int n = 0;
+        for (PrefabFile.Fluid f : prefab.fluids) {
+            int id = f.name == null ? -1 : fluidIds.applyAsInt(f.name);
+            if (id <= 0) {
+                unknown.merge(String.valueOf(f.name), 1, Integer::sum);
+                continue;
+            }
+            dx[n] = f.x;
+            dy[n] = f.y;
+            dz[n] = f.z;
+            ids[n] = id;
+            level[n] = (byte) f.level;
+            n++;
+        }
+        byte[] levelT = new byte[n];
+        System.arraycopy(level, 0, levelT, 0, n);
+        return new Blueprint.Fluids(trim(dx, n), trim(dy, n), trim(dz, n), trim(ids, n), levelT);
     }
 
     private static int[] trim(int[] src, int len) {

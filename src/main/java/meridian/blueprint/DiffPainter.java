@@ -3,6 +3,7 @@ package meridian.blueprint;
 import java.util.Arrays;
 import meridian.core.api.Block;
 import meridian.core.api.DebugRender;
+import meridian.core.api.FluidCell;
 import meridian.core.api.World;
 import org.slf4j.Logger;
 
@@ -36,7 +37,10 @@ final class DiffPainter {
     private final BlockNameResolver blocks;
     private final Blueprint bp;
 
-    /** Last-tick scan results; index aligned with {@link Blueprint#dx}. */
+    /**
+     * Last-tick scan results: the blocks first, index aligned with {@link Blueprint#dx}, then the
+     * fluid cells, index {@code bp.size + i} for fluid {@code i}.
+     */
     private final CellState[] cached;
     /** Scratch buffer for this tick's scan; same shape as {@link #cached}, reused. */
     private final CellState[] next;
@@ -58,16 +62,18 @@ final class DiffPainter {
         this.debug = debug;
         this.blocks = blocks;
         this.bp = bp;
-        this.cached = new CellState[bp.size];
-        this.next = new CellState[bp.size];
+        int cells = bp.size + bp.fluids.size();
+        this.cached = new CellState[cells];
+        this.next = new CellState[cells];
 
         int lo = Integer.MAX_VALUE, hi = Integer.MIN_VALUE;
-        for (int i = 0; i < bp.size; i++) {
-            if (bp.dy[i] < lo) lo = bp.dy[i];
-            if (bp.dy[i] > hi) hi = bp.dy[i];
+        for (int i = 0; i < cells; i++) {
+            int dy = dyOf(i);
+            if (dy < lo) lo = dy;
+            if (dy > hi) hi = dy;
         }
-        this.minLayer = bp.size == 0 ? 0 : lo;
-        this.maxLayer = bp.size == 0 ? 0 : hi;
+        this.minLayer = cells == 0 ? 0 : lo;
+        this.maxLayer = cells == 0 ? 0 : hi;
         // Default: window covers the whole stack.
         this.layerLo = minLayer;
         this.layerHi = maxLayer + 1;
@@ -83,7 +89,12 @@ final class DiffPainter {
     int lastWrong()     { return lastWrong; }
     int lastMissing()   { return lastMissing; }
     int lastRotated()   { return lastRotated; }
-    int totalCells()    { return bp.size; }
+    int totalCells()    { return bp.size + bp.fluids.size(); }
+
+    /** A cell's offsets: a block's below {@code bp.size}, a fluid's from there on. */
+    private int dxOf(int i) { return i < bp.size ? bp.dx[i] : bp.fluids.dx()[i - bp.size]; }
+    private int dyOf(int i) { return i < bp.size ? bp.dy[i] : bp.fluids.dy()[i - bp.size]; }
+    private int dzOf(int i) { return i < bp.size ? bp.dz[i] : bp.fluids.dz()[i - bp.size]; }
 
     /**
      * Configures the visible layer window. {@code currentLayer} is the bottom
@@ -115,7 +126,7 @@ final class DiffPainter {
      * repaint, {@code false} if nothing changed.
      */
     boolean tick() {
-        int n = bp.size;
+        int n = bp.size + bp.fluids.size();
         int correct = 0, wrong = 0, missing = 0, rotated = 0;
         blocks.refresh();
         boolean changed = false;
@@ -125,11 +136,23 @@ final class DiffPainter {
         // the layer window are treated as CORRECT — they're invisible to
         // the overlay logic without a second filter branch.
         for (int i = 0; i < n; i++) {
-            int dy = bp.dy[i];
+            int dy = dyOf(i);
             CellState ns;
             if (dy < lo || dy >= hi) {
                 ns = CellState.CORRECT;
                 correct++;
+            } else if (i >= bp.size) {
+                // A fluid: the same fluid there is right, whatever its level - the flow settles
+                // by itself once the sources are in.
+                FluidCell actual = world.fluidCellAt(bp.anchorX + dxOf(i), bp.anchorY + dy,
+                        bp.anchorZ + dzOf(i));
+                if (actual == null) {
+                    ns = CellState.MISSING; missing++;
+                } else if (actual.id() != bp.fluids.fluidId()[i - bp.size]) {
+                    ns = CellState.WRONG; wrong++;
+                } else {
+                    ns = CellState.CORRECT; correct++;
+                }
             } else {
                 Block actual = world.blockAt(bp.anchorX + bp.dx[i],
                         bp.anchorY + dy,
@@ -137,7 +160,9 @@ final class DiffPainter {
                 int actualId = actual != null && actual.type() != null ? actual.type().id() : 0;
                 if (actual == null || actual.isAir() || actualId <= 0) {
                     ns = CellState.MISSING; missing++;
-                } else if (!blocks.sameBlock(actualId, bp.blockId[i])) {
+                } else if (actual.isFiller() || !blocks.sameBlock(actualId, bp.blockId[i])) {
+                    // A filler here means a bigger block stands on another cell and only reaches
+                    // into this one - the door was put one cell off.
                     ns = CellState.WRONG; wrong++;
                 } else if (blocks.rotationMatters(actualId)
                         && !BlockRotations.same(actual.rotation(), bp.rotation[i] & 0xFF)) {
@@ -161,9 +186,9 @@ final class DiffPainter {
         for (int i = 0; i < n; i++) {
             CellState s = next[i];
             if (!s.visible) continue;
-            debug.box(bp.anchorX + bp.dx[i] + 0.5,
-                    bp.anchorY + bp.dy[i] + 0.5,
-                    bp.anchorZ + bp.dz[i] + 0.5,
+            debug.box(bp.anchorX + dxOf(i) + 0.5,
+                    bp.anchorY + dyOf(i) + 0.5,
+                    bp.anchorZ + dzOf(i) + 0.5,
                     OVERLAY_SIZE, OVERLAY_SIZE, OVERLAY_SIZE,
                     s.r, s.g, s.b, OPACITY, DEBUG_BOX_TTL_S);
             emitted++;

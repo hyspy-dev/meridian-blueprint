@@ -25,9 +25,36 @@ final class Blueprint {
     final int[] dz;
     final int[] blockId;
     final byte[] rotation;
+    /** Water, lava and the like - a layer of their own, beside the blocks; may share their cells. */
+    final Fluids fluids;
+
+    /**
+     * The fluid cells, laid out like the blocks: offsets from the same anchor, the fluid's id on
+     * this connection, and its level as the server keeps it. A source and its flow are separate
+     * fluids ({@code Water_Source}, {@code Water}).
+     */
+    record Fluids(int[] dx, int[] dy, int[] dz, int[] fluidId, byte[] level) {
+        static final Fluids NONE = new Fluids(new int[0], new int[0], new int[0], new int[0], new byte[0]);
+
+        Fluids {
+            if (dx.length != dy.length || dy.length != dz.length
+                    || dz.length != fluidId.length || fluidId.length != level.length) {
+                throw new IllegalArgumentException("fluid arrays must have equal length");
+            }
+        }
+
+        int size() {
+            return dx.length;
+        }
+    }
 
     Blueprint(int anchorX, int anchorY, int anchorZ,
               int[] dx, int[] dy, int[] dz, int[] blockId, byte[] rotation) {
+        this(anchorX, anchorY, anchorZ, dx, dy, dz, blockId, rotation, Fluids.NONE);
+    }
+
+    Blueprint(int anchorX, int anchorY, int anchorZ,
+              int[] dx, int[] dy, int[] dz, int[] blockId, byte[] rotation, Fluids fluids) {
         if (dx.length != dy.length || dy.length != dz.length
                 || dz.length != blockId.length || blockId.length != rotation.length) {
             throw new IllegalArgumentException("blueprint arrays must have equal length");
@@ -41,5 +68,6 @@ final class Blueprint {
         this.dz = dz;
         this.blockId = blockId;
         this.rotation = rotation;
+        this.fluids = fluids == null ? Fluids.NONE : fluids;
     }
 }

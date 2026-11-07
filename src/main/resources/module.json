@@ -5,7 +5,7 @@
   "priority": 100,
   "updateUrl": "https://github.com/hyspy-dev/meridian-blueprint/releases",
   "dependsOn": {
-    "meridian-core": ">=0.2.0"
+    "meridian-core": ">=1.7.5"
   },
   "requires": {
     "services": [
