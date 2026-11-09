@@ -33,8 +33,6 @@ final class DiffPainter {
     private final Logger log;
     private final World world;
     private final DebugRender debug;
-    /** Which ids are states of one block, and which blocks' facing counts. */
-    private final BlockNameResolver blocks;
     private final Blueprint bp;
 
     /**
@@ -56,11 +54,10 @@ final class DiffPainter {
     /** Latest counters from the previous tick — exposed for liveText / logging. */
     private volatile int lastCorrect, lastWrong, lastMissing, lastRotated;
 
-    DiffPainter(Logger log, World world, DebugRender debug, BlockNameResolver blocks, Blueprint bp) {
+    DiffPainter(Logger log, World world, DebugRender debug, Blueprint bp) {
         this.log = log;
         this.world = world;
         this.debug = debug;
-        this.blocks = blocks;
         this.bp = bp;
         int cells = bp.size + bp.fluids.size();
         this.cached = new CellState[cells];
@@ -128,7 +125,6 @@ final class DiffPainter {
     boolean tick() {
         int n = bp.size + bp.fluids.size();
         int correct = 0, wrong = 0, missing = 0, rotated = 0;
-        blocks.refresh();
         boolean changed = false;
         int lo = layerLo, hi = layerHi;
 
@@ -160,12 +156,13 @@ final class DiffPainter {
                 int actualId = actual != null && actual.type() != null ? actual.type().id() : 0;
                 if (actual == null || actual.isAir() || actualId <= 0) {
                     ns = CellState.MISSING; missing++;
-                } else if (actual.isFiller() || !blocks.sameBlock(actualId, bp.blockId[i])) {
-                    // A filler here means a bigger block stands on another cell and only reaches
-                    // into this one - the door was put one cell off.
+                } else if (!actual.matches(bp.blockId[i], actual.rotation())) {
+                    // Another block - or a filler: a bigger block stands on another cell and only
+                    // reaches into this one, the door was put one cell off. A state of the same
+                    // block (an open door where a shut one was drawn) is the block.
                     ns = CellState.WRONG; wrong++;
-                } else if (blocks.rotationMatters(actualId)
-                        && !BlockRotations.same(actual.rotation(), bp.rotation[i] & 0xFF)) {
+                } else if (!actual.matches(bp.blockId[i], bp.rotation[i] & 0xFF)) {
+                    // The right block facing another way - for a block whose facing counts.
                     ns = CellState.ROTATED; rotated++;
                 } else {
                     ns = CellState.CORRECT; correct++;

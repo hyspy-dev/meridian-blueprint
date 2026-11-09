@@ -1,150 +1,50 @@
 package meridian.blueprint;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
-import meridian.core.api.Block;
-import meridian.core.api.World;
+import meridian.core.api.BlockPos;
+import meridian.core.api.Prefabs;
 
 /**
- * Captures a selection box into a {@code .prefab.json} on disk — the same
- * format the server uses, so files saved here drop straight into a server's
- * {@code prefabs/} directory and load via the in-game paste tool.
+ * Captures a selection box into a {@code .prefab.json} on disk — the server's own format, so files
+ * saved here drop straight into a server's {@code prefabs/} directory and load via the in-game paste
+ * tool. The format and the capture are core's ({@link Prefabs}); what is here is where the file goes.
  *
- * <p>Air is skipped — sparse prefabs (a house with hollow rooms) end up
- * smaller and don't carry meaningless "Empty" markers. If we ever need
- * sealed volumes (where every voxel including air is named) we'd add a
- * toggle here; for now the captured prefab matches what the player would
- * see if they walked through the volume.
- *
- * <p>JSON layout matches {@code SelectionPrefabSerializer} v8:
- * <pre>{@code
- * {
- *   "version": 8,
- *   "blockIdVersion": 0,
- *   "anchorX": 0, "anchorY": 0, "anchorZ": 0,
- *   "blocks": [ { "x":0, "y":0, "z":0, "name":"Rock_Stone" }, ... ]
- * }
- * }</pre>
+ * <p>Air is skipped — sparse prefabs (a house with hollow rooms) end up smaller and don't carry
+ * meaningless "Empty" markers. The cells a door or a bed only fills are kept, with their offset
+ * back to the block's own cell, as the server writes them.
  */
 final class PrefabSaver {
 
-    /** Serializer format version — same constant the server uses. */
-    private static final int VERSION = 8;
-    /** Block-id-version we stamp the file with. Server uses a migration
-     *  chain; we write 0 (== "no migration applied") and the receiving
-     *  server applies whatever chain it has registered on load. */
-    private static final int BLOCK_ID_VERSION = 0;
-
     private PrefabSaver() {}
 
-    /** POJO layout fed straight to Gson. Mirrors {@link PrefabFile} but
-     *  drops the loader-only fields we don't write back (support /
-     *  components — server treats absent as default). */
-    private static final class Doc {
-        int version = VERSION;
-        int blockIdVersion = BLOCK_ID_VERSION;
-        int anchorX, anchorY, anchorZ;
-        List<DocBlock> blocks;
-        /** Water and lava, as the server keeps them: a list beside the blocks; left out when dry. */
-        List<DocFluid> fluids;
-    }
-
-    private static final class DocFluid {
-        int x, y, z;
-        String name;
-        int level;
-
-        DocFluid(int x, int y, int z, String name, int level) {
-            this.x = x; this.y = y; this.z = z;
-            this.name = name;
-            this.level = level;
-        }
-    }
-
-    private static final class DocBlock {
-        int x, y, z;
-        String name;
-        Integer rotation;       // omitted when 0
-        /** Set on the cells a bigger block only fills, as the server writes them; omitted on a
-         *  block's own cell. A paste - the server's or ours - places the own cell alone. */
-        Integer filler;
-
-        DocBlock(int x, int y, int z, String name, int rotation, int filler) {
-            this.x = x; this.y = y; this.z = z;
-            this.name = name;
-            this.rotation = rotation == 0 ? null : rotation;
-            this.filler = filler == 0 ? null : filler;
-        }
-    }
-
     /**
-     * Scans every voxel inside the box, builds a {@link Doc}, and writes
-     * it as pretty-printed JSON to {@code dir/<name>.prefab.json}.
+     * Captures every voxel inside the box and writes it to {@code dir/<name>.prefab.json}.
      *
      * @return number of blocks written (air skipped)
      * @throws IOException on disk failure or unsafe filename
      */
-    static int save(World world, SelectionStore.Box box, Path dir, String name) throws IOException {
-        String safe = sanitize(name);
-        if (safe.isEmpty()) {
+    static int save(Prefabs prefabs, SelectionStore.Box box, Path dir, String name) throws IOException {
+        Path target = targetOf(dir, name);
+        if (target == null) {
             throw new IOException("blueprint name is empty after sanitisation");
         }
-        Path target = dir.resolve(safe + ".prefab.json");
-
-        List<DocBlock> blocks = new ArrayList<>(Math.min(box.blockCount(), 4096));
-        FluidCollector wet = new FluidCollector();
-        for (int y = box.yMin(); y <= box.yMax(); y++) {
-            for (int z = box.zMin(); z <= box.zMax(); z++) {
-                for (int x = box.xMin(); x <= box.xMax(); x++) {
-                    wet.add(world.fluidCellAt(x, y, z), x - box.xMin(), y - box.yMin(), z - box.zMin());
-                    Block b = world.blockAt(x, y, z);
-                    if (b == null || b.type() == null || b.isAir()) continue;
-                    String typeName = b.type().name();
-                    if (typeName == null || typeName.isEmpty()) continue;
-                    blocks.add(new DocBlock(
-                            x - box.xMin(),
-                            y - box.yMin(),
-                            z - box.zMin(),
-                            typeName,
-                            b.rotation(),
-                            b.filler()));
-                }
-            }
-        }
-
-        Doc doc = new Doc();
-        doc.blocks = blocks;
-        if (!wet.cells().isEmpty()) {
-            doc.fluids = new ArrayList<>(wet.cells().size());
-            for (FluidCollector.Cell c : wet.cells()) {
-                doc.fluids.add(new DocFluid(c.x(), c.y(), c.z(), c.name(), c.level()));
-            }
-        }
-        // anchor stays (0,0,0) — the file's coords are already local; the
-        // server's "anchor" is where the prefab pins to the world on paste,
-        // and 0,0,0 is the conventional default ("pin at the local origin").
-
-        Files.createDirectories(target.getParent());
-        Gson gson = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
-        String json = gson.toJson(doc);
-        Files.writeString(target, json, StandardCharsets.UTF_8);
-        return blocks.size();
+        // The box's lowest corner is the anchor (0, 0, 0): the file's cells are already local, and
+        // the anchor is where the prefab pins to the world on paste.
+        Prefabs.Prefab prefab = prefabs.capture(new BlockPos(box.xMin(), box.yMin(), box.zMin()),
+                new BlockPos(box.xMax(), box.yMax(), box.zMax()));
+        prefabs.write(target, prefab);
+        return prefab.blocks().size();
     }
 
-    /** Strips characters that would either break the path or clash with the
-     *  {@code .prefab.json} suffix the library scans for. */
     /** The file a prefab saved under {@code name} goes to - to ask before overwriting it. */
     static Path targetOf(Path dir, String name) {
         String safe = sanitize(name);
         return safe.isEmpty() ? null : dir.resolve(safe + ".prefab.json");
     }
 
+    /** Strips characters that would either break the path or clash with the
+     *  {@code .prefab.json} suffix the library scans for. */
     private static String sanitize(String raw) {
         if (raw == null) return "";
         String t = raw.trim();

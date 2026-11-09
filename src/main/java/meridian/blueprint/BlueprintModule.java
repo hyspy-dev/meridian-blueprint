@@ -12,6 +12,7 @@ import meridian.core.api.ClientAssets;
 import meridian.core.api.DebugRender;
 import meridian.core.api.Pages;
 import meridian.core.api.PastePreview;
+import meridian.core.api.Prefabs;
 import meridian.core.api.World;
 import meridian.core.api.WorldState;
 import org.slf4j.Logger;
@@ -74,16 +75,16 @@ public class BlueprintModule implements ProxyModule {
         BuilderSelection builderSelection = ctx.services().get(BuilderSelection.class).orElse(null);
         Scheduler scheduler = ctx.scheduler();
 
-        BlockNameResolver names = new BlockNameResolver(worldState);
+        Prefabs prefabs = ctx.services().require(Prefabs.class);
         PreviewController preview = new PreviewController(
-                log, world, debug, names, pastePreview, builderSelection);
+                log, world, worldState, prefabs, debug, pastePreview, builderSelection);
 
         PrefabLibrary library = new PrefabLibrary(log, ctx.getDataDir());
-        // The paste tool's E opens the game's prefab list; with a core that can open windows we
-        // fill it with our prefabs instead of the server's.
+        // The paste tool's E opens the game's prefab list; core opens it over our prefabs instead
+        // of the server's.
+        preview.setLibrary(library);
         Pages pages = ctx.services().get(Pages.class).orElse(null);
         if (pages != null && builderSelection != null) {
-            preview.setPrefabList(new PrefabListWindow(log, pages, builderSelection, library, preview, scheduler));
             // The blueprint tool's F opens a document of ours; it rides along with the client's load.
             ClientAssets assets = ctx.services().get(ClientAssets.class).orElse(null);
             byte[] panel = resource("/ui/MeridianBlueprintPanel.ui", log);

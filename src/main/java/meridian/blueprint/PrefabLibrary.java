@@ -60,6 +60,30 @@ final class PrefabLibrary {
         return r.isEmpty() ? List.of(EMPTY_HINT) : r;
     }
 
+    /** The prefabs of the latest scan by name - the file name without its suffix - newest first. */
+    List<String> names() {
+        List<String> out = new ArrayList<>();
+        for (Path p : snapshot.paths()) {
+            out.add(nameOf(p));
+        }
+        return out;
+    }
+
+    /** The file of the latest scan a name stands for. */
+    Optional<Path> pathOf(String name) {
+        for (Path p : snapshot.paths()) {
+            if (nameOf(p).equals(name)) {
+                return Optional.of(p);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static String nameOf(Path p) {
+        String file = p.getFileName().toString();
+        return file.endsWith(PREFAB_SUFFIX) ? file.substring(0, file.length() - PREFAB_SUFFIX.length()) : file;
+    }
+
     /** Resolves a row index from the most-recent snapshot to its file path. */
     Optional<Path> pathAt(int index) {
         Snapshot s = snapshot;

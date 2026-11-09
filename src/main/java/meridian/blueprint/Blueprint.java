@@ -1,5 +1,10 @@
 package meridian.blueprint;
 
+import java.util.ArrayList;
+import java.util.List;
+import meridian.core.api.Clipboard;
+import meridian.core.api.PastePreview;
+
 /**
  * Immutable blueprint payload — what the player wants placed and where.
  *
@@ -69,5 +74,48 @@ final class Blueprint {
         this.blockId = blockId;
         this.rotation = rotation;
         this.fluids = fluids == null ? Fluids.NONE : fluids;
+    }
+
+    /** A clipboard - cells relative to its anchor - as a blueprint whose anchor is at {@code (x, y, z)}. */
+    static Blueprint of(int x, int y, int z, Clipboard clipboard) {
+        List<PastePreview.Change> blocks = clipboard.blocks();
+        int n = blocks.size();
+        int[] dx = new int[n], dy = new int[n], dz = new int[n], ids = new int[n];
+        byte[] rot = new byte[n];
+        for (int i = 0; i < n; i++) {
+            PastePreview.Change c = blocks.get(i);
+            dx[i] = c.dx();
+            dy[i] = c.dy();
+            dz[i] = c.dz();
+            ids[i] = c.blockId();
+            rot[i] = (byte) c.rotation();
+        }
+        List<PastePreview.FluidChange> wet = clipboard.fluids();
+        int m = wet.size();
+        int[] fx = new int[m], fy = new int[m], fz = new int[m], fids = new int[m];
+        byte[] level = new byte[m];
+        for (int i = 0; i < m; i++) {
+            PastePreview.FluidChange f = wet.get(i);
+            fx[i] = f.dx();
+            fy[i] = f.dy();
+            fz[i] = f.dz();
+            fids[i] = f.fluidId();
+            level[i] = (byte) f.level();
+        }
+        return new Blueprint(x, y, z, dx, dy, dz, ids, rot, m == 0 ? Fluids.NONE : new Fluids(fx, fy, fz, fids, level));
+    }
+
+    /** The cells as a clipboard, relative to the anchor - what the paste tool and the preview take. */
+    Clipboard toClipboard() {
+        List<PastePreview.Change> blocks = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            blocks.add(new PastePreview.Change(dx[i], dy[i], dz[i], blockId[i], rotation[i] & 0xFF));
+        }
+        List<PastePreview.FluidChange> wet = new ArrayList<>(fluids.size());
+        for (int i = 0; i < fluids.size(); i++) {
+            wet.add(new PastePreview.FluidChange(fluids.dx()[i], fluids.dy()[i], fluids.dz()[i],
+                    fluids.fluidId()[i], fluids.level()[i]));
+        }
+        return new Clipboard(blocks, wet);
     }
 }

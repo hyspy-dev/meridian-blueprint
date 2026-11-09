@@ -4,20 +4,26 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.OptionalInt;
 import java.util.concurrent.ScheduledFuture;
 import meridian.api.module.Scheduler;
 import meridian.core.api.Block;
 import meridian.core.api.BlockPos;
-import meridian.core.api.DebugRender;
-import java.util.List;
+import meridian.core.api.BlockView;
 import meridian.core.api.BuilderSelection;
+import meridian.core.api.Clipboard;
+import meridian.core.api.DebugRender;
 import meridian.core.api.PastePreview;
 import meridian.core.api.Player;
+import meridian.core.api.Prefabs;
+import meridian.core.api.Rotation;
 import meridian.core.api.Vec3;
 import meridian.core.api.World;
+import meridian.core.api.WorldState;
 import org.slf4j.Logger;
 
 /**
@@ -27,8 +33,8 @@ import org.slf4j.Logger;
  *
  * <p>Everything visual is delegated:
  * <ul>
- *   <li>{@link BlueprintBuilder} turns inputs (sanity request, parsed
- *       prefab) into a {@link Blueprint}.</li>
+ *   <li>Core's {@link Prefabs} reads, writes and captures prefabs, and resolves one into
+ *       {@link Clipboard} blocks; {@link Blueprint#of} lays those out for the painter.</li>
  *   <li>{@link DiffPainter} runs the per-tick scan and the
  *       {@code DisplayDebug} overlay.</li>
  * </ul>
@@ -78,7 +84,10 @@ final class PreviewController {
     private final Logger log;
     private final World world;
     private final DebugRender debug;
-    private final BlockNameResolver names;
+    /** The block catalog: each block's flip type, for a mirror. */
+    private final WorldState worldState;
+    /** The server's prefab files, and the world taken into one. */
+    private final Prefabs prefabs;
     private final SelectionStore selection = new SelectionStore();
     /** Core owns the wire; this draws the ghost. Null-safe: no client, no-op. */
     private final PastePreview pastePreview;
@@ -135,11 +144,9 @@ final class PreviewController {
     }
     /**
      * What the game's paste tool holds: the blueprint last chosen or selected, its cells relative
-     * to its anchor and unturned. Null until something is chosen.
+     * to its anchor and unturned - core turns it as the tool is turned. Null until something is chosen.
      */
     private volatile Blueprint clipboard;
-    /** The quarter turns given to the paste tool's clipboard since it was loaded, in order: {axis, steps}. */
-    private final List<int[]> clipboardTurns = new CopyOnWriteArrayList<>();
     /** Whether our tools are up - the paste tool holds our clipboard only while they are. */
     private volatile boolean blueprinting;
     /** For the projection a paste puts down; handed over when blueprinting is switched on. */
@@ -162,19 +169,20 @@ final class PreviewController {
     /** Number of layers shown; 0 = no limit (show the whole stack). */
     private volatile int windowSize;
 
-    /** The paste tool's prefab list (its E key), when core can open windows. */
-    private volatile PrefabListWindow prefabList;
+    /** The module's prefabs, for the paste tool's prefab list (its E key). */
+    private volatile PrefabLibrary library;
 
-    void setPrefabList(PrefabListWindow window) {
-        prefabList = window;
+    void setLibrary(PrefabLibrary library) {
+        this.library = library;
     }
 
-    PreviewController(Logger log, World world, DebugRender debug, BlockNameResolver names,
+    PreviewController(Logger log, World world, WorldState worldState, Prefabs prefabs, DebugRender debug,
                       PastePreview pastePreview, BuilderSelection builderSelection) {
         this.log = log;
         this.world = world;
+        this.worldState = worldState;
+        this.prefabs = prefabs;
         this.debug = debug;
-        this.names = names;
         this.pastePreview = pastePreview;
         this.builderSelection = builderSelection;
     }
@@ -213,44 +221,32 @@ final class PreviewController {
             // each opens are the next step; this is the round-trip we are proving first.
             builderSelection.onTool(this::onTool);
             // The game's own paste tool, holding our blueprint: it follows the cursor and turns on
-            // its usual keys by itself; we only hear the turns and where it was pasted.
+            // its usual keys by itself, and core answers the turns and mirrors as the server would;
+            // we hear where it was pasted, and the clipboard as the tool held it then.
             builderSelection.onPaste(new BuilderSelection.PasteListener() {
                 @Override public void turned(BuilderSelection.Axis axis, int degrees) {
-                    clipboardTurns.add(new int[] {axis.ordinal(), Math.floorMod(degrees / 90, 4)});
                     log.info("paste tool turned {} by {}", axis, degrees);
-                    // The client spun its preview and waits for the turned clipboard, as the
-                    // server would send it.
-                    confirmTurned();
                 }
                 @Override public void flipped(BuilderSelection.Axis axis) {
-                    clipboardTurns.add(new int[] {axis.ordinal(), FLIP});
                     log.info("paste tool flipped across {}", axis);
-                    confirmTurned();
                 }
                 @Override public void copyAsked() {
                     copySelection();
                 }
                 @Override public void listAsked() {
-                    PrefabListWindow window = prefabList;
-                    if (window != null) {
-                        window.open();
-                    } else {
-                        log.info("paste tool asked for the prefab list - no window on this core");
-                    }
+                    openPrefabList();
                 }
                 @Override public void reset() {
-                    clipboardTurns.clear();
                     log.info("paste tool turns reset");
-                    builderSelection.setClipboard(clipboardChanges(), clipboardFluidChanges());
                 }
-                @Override public void pasted(int x, int y, int z) {
-                    placeClipboard(x, y, z);
+                @Override public void pasted(int x, int y, int z, Clipboard turned) {
+                    placeClipboard(x, y, z, turned);
                 }
             });
             builderSelection.defineTools(TOOL_SPECS);   // teach the client our items
             toolsWired = true;
         }
-        builderSelection.setClipboard(on ? clipboardChanges() : null, on ? clipboardFluidChanges() : null);
+        builderSelection.setClipboard(on ? clipboardHeld() : null);
         builderSelection.forceTools(on
                 ? List.of(
                         BuilderSelection.SELECTION_TOOL,   // slot 0: outline a selection
@@ -349,7 +345,12 @@ final class PreviewController {
         int ox = (int) Math.floor(pos.get().x());
         int oy = (int) Math.floor(pos.get().y());
         int oz = (int) Math.floor(pos.get().z());
-        int blockId = sampleStandingBlockId(ox, oy - 1, oz);
+        OptionalInt standing = sampleStandingBlockId(ox, oy - 1, oz);
+        if (standing.isEmpty()) {
+            log.warn("no block to build the sanity cube of - the catalog has not arrived");
+            return;
+        }
+        int blockId = standing.getAsInt();
 
         Blueprint bp = BlueprintBuilder.sanityCube(ox, oy, oz, blockId);
         startBlueprint(scheduler, bp, "sanity cube (blockId=" + blockId + ")");
@@ -371,19 +372,26 @@ final class PreviewController {
      * thread.
      */
     Optional<Blueprint> readPrefab(Path prefabPath) {
-        PrefabFile prefab;
+        return resolvePrefab(prefabPath, 0, 0, 0).map(Loaded::blueprint);
+    }
+
+    /** A prefab as a blueprint, and what was left out of it. */
+    private record Loaded(Blueprint blueprint, int skippedEmpty) {}
+
+    /** A prefab file, resolved to this connection's blocks and anchored at {@code (x, y, z)}. */
+    private Optional<Loaded> resolvePrefab(Path prefabPath, int x, int y, int z) {
+        Prefabs.Resolved resolved;
         try {
-            prefab = PrefabLoader.load(prefabPath);
+            resolved = prefabs.resolve(prefabs.read(prefabPath));
         } catch (IOException e) {
             log.warn("failed to read prefab {}", prefabPath, e);
             return Optional.empty();
         }
-        BlueprintBuilder.Result result = BlueprintBuilder.fromPrefab(prefab, names, world::fluidId, 0, 0, 0);
-        if (!result.unknownNames().isEmpty()) {
-            log.warn("skipped {} unique unknown block types: {}",
-                    result.unknownNames().size(), result.unknownNames());
+        if (!resolved.unknown().isEmpty()) {
+            log.warn("skipped {} unique unknown block types: {}", resolved.unknown().size(), resolved.unknown());
         }
-        return result.blueprint().size == 0 ? Optional.empty() : Optional.of(result.blueprint());
+        Blueprint bp = Blueprint.of(x, y, z, resolved.clipboard());
+        return bp.size == 0 ? Optional.empty() : Optional.of(new Loaded(bp, resolved.empty()));
     }
 
     /** Puts a prefab file into the paste tool - the prefab list's Load. */
@@ -404,35 +412,21 @@ final class PreviewController {
         Optional<Vec3> pos = playerPosition();
         if (pos.isEmpty()) return;
 
-        PrefabFile prefab;
-        try {
-            prefab = PrefabLoader.load(prefabPath);
-        } catch (IOException e) {
-            log.warn("failed to read prefab {}", prefabPath, e);
-            return;
-        }
-        if (prefab.version != 8) {
-            log.warn("prefab version {} not the expected 8 — trying anyway", prefab.version);
-        }
-
         int ox = (int) Math.floor(pos.get().x());
         int oy = (int) Math.floor(pos.get().y());
         int oz = (int) Math.floor(pos.get().z());
-        BlueprintBuilder.Result result = BlueprintBuilder.fromPrefab(prefab, names, world::fluidId, ox, oy, oz);
-        if (!result.unknownNames().isEmpty()) {
-            log.warn("skipped {} unique unknown block types: {}",
-                    result.unknownNames().size(), result.unknownNames());
-        }
-        if (result.blueprint().size == 0) {
+        Optional<Loaded> loaded = resolvePrefab(prefabPath, ox, oy, oz);
+        if (loaded.isEmpty()) {
             log.warn("prefab {} has no usable blocks after resolution", prefabPath);
             return;
         }
-        String label = prefabPath.getFileName() + " (" + result.blueprint().size + " blocks, "
-                + result.skippedEmpty() + " Empty skipped)";
-        if (loadIntoPasteTool(result.blueprint(), label)) {
+        Blueprint bp = loaded.get().blueprint();
+        String label = prefabPath.getFileName() + " (" + bp.size + " blocks, "
+                + loaded.get().skippedEmpty() + " Empty skipped)";
+        if (loadIntoPasteTool(bp, label)) {
             return;
         }
-        startBlueprint(scheduler, result.blueprint(), label);
+        startBlueprint(scheduler, bp, label);
     }
 
     /**
@@ -602,7 +596,7 @@ final class PreviewController {
                     + MAX_SELECTION_BLOCKS + ")";
         }
         try {
-            int blocks = PrefabSaver.save(world, b, prefabsDir, name.trim());
+            int blocks = PrefabSaver.save(prefabs, b, prefabsDir, name.trim());
             log.info("saved {} blocks → {}/{}.prefab.json", blocks, prefabsDir, name.trim());
             return blocks;
         } catch (IOException e) {
@@ -682,34 +676,16 @@ final class PreviewController {
             return;
         }
 
-        int[] dx = new int[volume], dy = new int[volume], dz = new int[volume], ids = new int[volume];
-        byte[] rot = new byte[volume];
-        FluidCollector wet = new FluidCollector();
-        int i = 0;
-        for (int y = b.yMin(); y <= b.yMax(); y++) {
-            for (int z = b.zMin(); z <= b.zMax(); z++) {
-                for (int x = b.xMin(); x <= b.xMax(); x++) {
-                    wet.add(world.fluidCellAt(x, y, z), x - b.xMin(), y - b.yMin(), z - b.zMin());
-                    Block blk = world.blockAt(x, y, z);
-                    int id = blk != null && blk.type() != null ? blk.type().id() : 0;
-                    if (id <= 0) continue;             // skip air
-                    // A door's or a bed's other cells: placing it on its own cell brings them back.
-                    if (blk.isFiller()) continue;
-                    dx[i] = x - b.xMin();
-                    dy[i] = y - b.yMin();
-                    dz[i] = z - b.zMin();
-                    ids[i] = id;
-                    rot[i] = (byte) blk.rotation();
-                    i++;
-                }
-            }
-        }
+        // The same capture a save makes, put down as a paste would: the cells a door or a bed only
+        // fills are left out - placing it on its own cell brings them back.
+        Prefabs.Resolved resolved = prefabs.resolve(prefabs.capture(
+                new BlockPos(b.xMin(), b.yMin(), b.zMin()), new BlockPos(b.xMax(), b.yMax(), b.zMax())));
+        Blueprint bp = Blueprint.of(b.xMin(), b.yMin(), b.zMin(), resolved.clipboard());
+        int i = bp.size;
         if (i == 0) {
             log.warn("selection contains no solid blocks");
             return;
         }
-        Blueprint bp = new Blueprint(b.xMin(), b.yMin(), b.zMin(),
-                trim(dx, i), trim(dy, i), trim(dz, i), trim(ids, i), trim(rot, i), wet.build());
         String label = "selection (" + i + "/" + volume + " blocks, "
                 + b.sizeX() + "x" + b.sizeY() + "x" + b.sizeZ() + ")";
         if (loadIntoPasteTool(bp, label)) {
@@ -730,20 +706,6 @@ final class PreviewController {
 
     private static String fmt(BlockPos p) {
         return p.x() + "," + p.y() + "," + p.z();
-    }
-
-    private static int[] trim(int[] src, int len) {
-        if (len == src.length) return src;
-        int[] out = new int[len];
-        System.arraycopy(src, 0, out, 0, len);
-        return out;
-    }
-
-    private static byte[] trim(byte[] src, int len) {
-        if (len == src.length) return src;
-        byte[] out = new byte[len];
-        System.arraycopy(src, 0, out, 0, len);
-        return out;
     }
 
     // ------------------------------------------------------------------
@@ -815,7 +777,7 @@ final class PreviewController {
     /**
      * Mirrors the active preview across the plane perpendicular to the given
      * axis. {@code axis} — 0 = X, 1 = Y, 2 = Z. Every block is mirrored with
-     * it, as the server mirrors a symmetric block (see {@link BlockRotations#mirror}).
+     * it, each the way the server mirrors it - by its own flip type ({@link Clipboard#flipped}).
      */
     void mirrorPreview(int axis) {
         transformPreview(axis, true);
@@ -827,71 +789,43 @@ final class PreviewController {
             log.warn("transform ignored — no active preview");
             return;
         }
-        if (axis < 0 || axis > 2) return;
+        if (axis < Rotation.X || axis > Rotation.Z) return;
 
-        int n = bp.size;
-        int[] nx = new int[n], ny = new int[n], nz = new int[n];
-        byte[] nr = new byte[n];
-        for (int i = 0; i < n; i++) {
-            int x = bp.dx[i], y = bp.dy[i], z = bp.dz[i];
-            int r = bp.rotation[i] & 0xFF;
-            nr[i] = (byte) (mirror ? BlockRotations.mirror(r, axis) : BlockRotations.rotate(r, axis));
-            if (mirror) {
-                nx[i] = (axis == 0) ? -x : x;
-                ny[i] = (axis == 1) ? -y : y;
-                nz[i] = (axis == 2) ? -z : z;
-            } else {
-                switch (axis) {
-                    case 0 -> { nx[i] = x;  ny[i] = -z; nz[i] =  y; }   // around X
-                    case 1 -> { nx[i] = z;  ny[i] =  y; nz[i] = -x; }   // around Y
-                    case 2 -> { nx[i] = -y; ny[i] =  x; nz[i] =  z; }   // around Z
-                }
-            }
-        }
-
-        Blueprint.Fluids f = bp.fluids;
-        int m = f.size();
-        int[] fx = new int[m], fy = new int[m], fz = new int[m];
-        for (int i = 0; i < m; i++) {
-            int x = f.dx()[i], y = f.dy()[i], z = f.dz()[i];
-            if (mirror) {
-                fx[i] = (axis == 0) ? -x : x;
-                fy[i] = (axis == 1) ? -y : y;
-                fz[i] = (axis == 2) ? -z : z;
-            } else {
-                switch (axis) {
-                    case 0 -> { fx[i] = x;  fy[i] = -z; fz[i] =  y; }
-                    case 1 -> { fx[i] = z;  fy[i] =  y; fz[i] = -x; }
-                    case 2 -> { fx[i] = -y; fy[i] =  x; fz[i] =  z; }
-                }
-            }
-        }
-
+        Clipboard c = bp.toClipboard();
+        c = mirror ? c.flipped(axis, flipTypes()) : c.turned(axis, 1);
+        // Back to non-negative offsets, the difference folded into the anchor, so nothing moves in
+        // the world at the moment of the transform but the cells about the anchor.
         int minX = 0, minY = 0, minZ = 0;
-        if (n + m > 0) {
+        if (!c.blocks().isEmpty() || !c.fluids().isEmpty()) {
             minX = minY = minZ = Integer.MAX_VALUE;
-            for (int i = 0; i < n; i++) {
-                minX = Math.min(minX, nx[i]); minY = Math.min(minY, ny[i]); minZ = Math.min(minZ, nz[i]);
+            for (PastePreview.Change ch : c.blocks()) {
+                minX = Math.min(minX, ch.dx()); minY = Math.min(minY, ch.dy()); minZ = Math.min(minZ, ch.dz());
             }
-            for (int i = 0; i < m; i++) {
-                minX = Math.min(minX, fx[i]); minY = Math.min(minY, fy[i]); minZ = Math.min(minZ, fz[i]);
-            }
-            for (int i = 0; i < n; i++) {
-                nx[i] -= minX;
-                ny[i] -= minY;
-                nz[i] -= minZ;
-            }
-            for (int i = 0; i < m; i++) {
-                fx[i] -= minX;
-                fy[i] -= minY;
-                fz[i] -= minZ;
+            for (PastePreview.FluidChange f : c.fluids()) {
+                minX = Math.min(minX, f.dx()); minY = Math.min(minY, f.dy()); minZ = Math.min(minZ, f.dz());
             }
         }
+        List<PastePreview.Change> blocks = new ArrayList<>(c.blocks().size());
+        for (PastePreview.Change ch : c.blocks()) {
+            blocks.add(new PastePreview.Change(ch.dx() - minX, ch.dy() - minY, ch.dz() - minZ, ch.blockId(),
+                    ch.rotation()));
+        }
+        List<PastePreview.FluidChange> fluids = new ArrayList<>(c.fluids().size());
+        for (PastePreview.FluidChange f : c.fluids()) {
+            fluids.add(new PastePreview.FluidChange(f.dx() - minX, f.dy() - minY, f.dz() - minZ, f.fluidId(),
+                    f.level()));
+        }
+        swapInBlueprint(Blueprint.of(bp.anchorX + minX, bp.anchorY + minY, bp.anchorZ + minZ,
+                new Clipboard(blocks, fluids)));
+    }
 
-        swapInBlueprint(new Blueprint(
-                bp.anchorX + minX, bp.anchorY + minY, bp.anchorZ + minZ,
-                nx, ny, nz, bp.blockId, nr,
-                new Blueprint.Fluids(fx, fy, fz, f.fluidId(), f.level())));
+    /** Each block's flip type by id, as core read it from the game's files. */
+    private java.util.function.IntFunction<Rotation.Flip> flipTypes() {
+        Map<Integer, Rotation.Flip> byId = new HashMap<>();
+        for (BlockView t : worldState.allBlockTypes()) {
+            byId.put(t.id(), t.flip());
+        }
+        return byId::get;
     }
 
     /** Replaces the active blueprint with {@code newBp}, rebuilds the
@@ -901,7 +835,7 @@ final class PreviewController {
         DiffPainter oldPainter = painter;
         if (oldPainter == null) return;
 
-        DiffPainter p = new DiffPainter(log, world, debug, names, newBp);
+        DiffPainter p = new DiffPainter(log, world, debug, newBp);
         if (windowSize > 0) {
             currentLayer = clampLayer(currentLayer, p);
             p.setWindow(currentLayer, windowSize);
@@ -949,7 +883,7 @@ final class PreviewController {
 
     private void startBlueprint(Scheduler scheduler, Blueprint bp, String label) {
         hide();
-        DiffPainter p = new DiffPainter(log, world, debug, names, bp);
+        DiffPainter p = new DiffPainter(log, world, debug, bp);
         // Start with the previously-chosen layer/window if they still make
         // sense; otherwise default to "show everything from the bottom".
         if (windowSize <= 0) {
@@ -1014,140 +948,64 @@ final class PreviewController {
     /** Makes {@code bp} what the paste tool holds, unturned, and hands it over if the tools are up. */
     private void loadClipboard(Blueprint bp) {
         clipboard = bp;
-        clipboardTurns.clear();
         if (builderSelection != null && blueprinting) {
-            builderSelection.setClipboard(clipboardChanges(), clipboardFluidChanges());
+            builderSelection.setClipboard(clipboardHeld());
         }
     }
 
-    /** The paste tool's clipboard as blocks relative to its anchor, or null when nothing is chosen. */
-    private List<PastePreview.Change> clipboardChanges() {
+    /** The paste tool's clipboard, relative to its anchor and unturned; null when nothing is chosen. */
+    private Clipboard clipboardHeld() {
         Blueprint bp = clipboard;
-        return bp == null ? null : changesOf(bp);
-    }
-
-    /** The paste tool clipboard's fluids, relative to its anchor; empty when nothing is chosen. */
-    private List<PastePreview.FluidChange> clipboardFluidChanges() {
-        Blueprint bp = clipboard;
-        return bp == null ? List.of() : fluidChangesOf(bp);
-    }
-
-    /** The clipboard turned the way the paste tool turned it, handed back as the server would. */
-    private void confirmTurned() {
-        Blueprint base = clipboard;
-        if (base != null && builderSelection != null) {
-            Blueprint turned = PreviewController.turned(base, clipboardTurns, 0, 0, 0);
-            builderSelection.confirmTurn(changesOf(turned), fluidChangesOf(turned));
-        }
-    }
-
-    /** A blueprint's fluid cells as clipboard fluids, relative to its anchor. */
-    static List<PastePreview.FluidChange> fluidChangesOf(Blueprint bp) {
-        Blueprint.Fluids f = bp.fluids;
-        List<PastePreview.FluidChange> out = new ArrayList<>(f.size());
-        for (int i = 0; i < f.size(); i++) {
-            out.add(new PastePreview.FluidChange(f.dx()[i], f.dy()[i], f.dz()[i], f.fluidId()[i],
-                    f.level()[i]));
-        }
-        return out;
-    }
-
-    /** A blueprint's cells as clipboard blocks, relative to its anchor. */
-    static List<PastePreview.Change> changesOf(Blueprint bp) {
-        List<PastePreview.Change> out = new ArrayList<>(bp.size);
-        for (int i = 0; i < bp.size; i++) {
-            out.add(new PastePreview.Change(bp.dx[i], bp.dy[i], bp.dz[i], bp.blockId[i],
-                    bp.rotation[i] & 0xFF));
-        }
-        return out;
+        return bp == null ? null : bp.toClipboard();
     }
 
     /**
-     * Puts the projection down where the paste tool pasted: the clipboard turned the way the
-     * player turned it, about its anchor, with the anchor at the pasted block - what the server
-     * would have built there. Nothing reaches the world; the projection is what moves.
+     * Puts the projection down where the paste tool pasted: the clipboard as the tool held it -
+     * turned and mirrored by core the way the player turned it - with its anchor at the pasted
+     * block: what the server would have built there. Nothing reaches the world; the projection is
+     * what moves.
      */
-    private void placeClipboard(int x, int y, int z) {
-        Blueprint base = clipboard;
+    private void placeClipboard(int x, int y, int z, Clipboard turned) {
         Scheduler scheduler = pasteScheduler;
-        if (base == null || scheduler == null) {
+        if (clipboard == null || turned == null || turned.isEmpty() || scheduler == null) {
             log.warn("paste ignored - no blueprint chosen yet");
             return;
         }
-        Blueprint placed = turned(base, clipboardTurns, x, y, z);
-        log.info("paste tool pasted at {},{},{} after {} turn(s)", x, y, z, clipboardTurns.size());
+        Blueprint placed = Blueprint.of(x, y, z, turned);
+        log.info("paste tool pasted at {},{},{}", x, y, z);
         // Off the network thread: the first scan of a big blueprint reads every one of its blocks.
         scheduler.schedule(() -> startBlueprint(scheduler, placed, "pasted at " + x + "," + y + "," + z),
                 Duration.ZERO);
     }
 
-    /** The steps of a {@code clipboardTurns} entry that make it a mirror instead of a turn. */
-    static final int FLIP = -1;
-
     /**
-     * {@code base} turned by each {@code {axis, quarterSteps}} in order, about its anchor, and
-     * anchored at {@code (x, y, z)}: positions by the server's {@code Axis.rotate}, each block's
-     * facing by {@link BlockRotations#rotate}. An entry of {@link #FLIP} steps mirrors across that
-     * axis through the anchor instead, as the server's {@code Axis.flip}, facings by
-     * {@link BlockRotations#mirror}.
+     * The paste tool's prefab list - the game's own window, which core opens and drives - over the
+     * module's prefabs.
      */
-    static Blueprint turned(Blueprint base, List<int[]> turns, int x, int y, int z) {
-        int n = base.size;
-        int[] dx = base.dx.clone(), dy = base.dy.clone(), dz = base.dz.clone();
-        byte[] rot = base.rotation.clone();
-        for (int[] turn : turns) {
-            if (turn[1] == FLIP) {
-                for (int i = 0; i < n; i++) {
-                    switch (turn[0]) {
-                        case BlockRotations.X -> dx[i] = -dx[i];
-                        case BlockRotations.Y -> dy[i] = -dy[i];
-                        case BlockRotations.Z -> dz[i] = -dz[i];
-                        default -> throw new IllegalArgumentException("axis " + turn[0]);
-                    }
-                    rot[i] = (byte) BlockRotations.mirror(rot[i] & 0xFF, turn[0]);
-                }
-                continue;
-            }
-            for (int step = 0; step < turn[1]; step++) {
-                for (int i = 0; i < n; i++) {
-                    int cx = dx[i], cy = dy[i], cz = dz[i];
-                    switch (turn[0]) {
-                        case BlockRotations.X -> { dy[i] = -cz; dz[i] = cy; }
-                        case BlockRotations.Y -> { dx[i] = cz; dz[i] = -cx; }
-                        case BlockRotations.Z -> { dx[i] = -cy; dy[i] = cx; }
-                        default -> throw new IllegalArgumentException("axis " + turn[0]);
-                    }
-                    rot[i] = (byte) BlockRotations.rotate(rot[i] & 0xFF, turn[0]);
-                }
-            }
+    private void openPrefabList() {
+        PrefabLibrary lib = library;
+        if (lib == null || builderSelection == null) {
+            log.info("paste tool asked for the prefab list - no prefabs here");
+            return;
         }
-        Blueprint.Fluids f = base.fluids;
-        int m = f.size();
-        int[] fx = f.dx().clone(), fy = f.dy().clone(), fz = f.dz().clone();
-        for (int[] turn : turns) {
-            for (int i = 0; i < m; i++) {
-                if (turn[1] == FLIP) {
-                    switch (turn[0]) {
-                        case BlockRotations.X -> fx[i] = -fx[i];
-                        case BlockRotations.Y -> fy[i] = -fy[i];
-                        case BlockRotations.Z -> fz[i] = -fz[i];
-                        default -> throw new IllegalArgumentException("axis " + turn[0]);
-                    }
-                    continue;
-                }
-                for (int step = 0; step < turn[1]; step++) {
-                    int cx = fx[i], cy = fy[i], cz = fz[i];
-                    switch (turn[0]) {
-                        case BlockRotations.X -> { fy[i] = -cz; fz[i] = cy; }
-                        case BlockRotations.Y -> { fx[i] = cz; fz[i] = -cx; }
-                        case BlockRotations.Z -> { fx[i] = -cy; fy[i] = cx; }
-                        default -> throw new IllegalArgumentException("axis " + turn[0]);
-                    }
-                }
+        boolean opened = builderSelection.openPrefabList("Blueprint prefabs", new BuilderSelection.PrefabSource() {
+            @Override public List<String> names() {
+                lib.refresh();
+                return lib.names();
             }
+            @Override public Optional<Clipboard> preview(String name) {
+                return lib.pathOf(name).flatMap(PreviewController.this::readPrefab).map(Blueprint::toClipboard);
+            }
+            @Override public void load(String name) {
+                lib.pathOf(name).ifPresent(PreviewController.this::loadPrefabIntoPasteTool);
+            }
+            @Override public String emptyText() {
+                return "No prefabs yet - save a selection from the Blueprint panel";
+            }
+        });
+        if (!opened) {
+            log.info("paste tool asked for the prefab list - no window on this core");
         }
-        return new Blueprint(x, y, z, dx, dy, dz, base.blockId, rot,
-                new Blueprint.Fluids(fx, fy, fz, f.fluidId(), f.level()));
     }
 
     private void sendPastePreview(Blueprint bp, int lo, int hi) {
@@ -1159,7 +1017,7 @@ final class PreviewController {
                     bp.dx[i], dy, bp.dz[i], bp.blockId[i], bp.rotation[i]));
         }
         List<PastePreview.FluidChange> wet = new ArrayList<>();
-        for (PastePreview.FluidChange f : fluidChangesOf(bp)) {
+        for (PastePreview.FluidChange f : bp.toClipboard().fluids()) {
             if (f.dy() >= lo && f.dy() < hi) {
                 wet.add(f);
             }
@@ -1193,13 +1051,16 @@ final class PreviewController {
         return p.map(Player::position);
     }
 
-    private int sampleStandingBlockId(int x, int y, int z) {
+    /**
+     * The block the player stands on, or - over air or unloaded ground - plain stone, so the cube is
+     * always something to see. Not id 1: that is the server's {@code Unknown}, the stand-in for a
+     * block it does not know. Empty when the catalog has not arrived.
+     */
+    private OptionalInt sampleStandingBlockId(int x, int y, int z) {
         Block under = world.blockAt(x, y, z);
-        if (under != null && under.type() != null) {
-            return under.type().id();
+        if (under != null && under.type() != null && under.type().id() > 0 && !under.isAir()) {
+            return OptionalInt.of(under.type().id());
         }
-        // Fallback — id 1 is the first registered non-air block on every
-        // Hytale catalog, so we always end up with *some* visible ghost.
-        return 1;
+        return worldState.blockId("Rock_Stone");
     }
 }
