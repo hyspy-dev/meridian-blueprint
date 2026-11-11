@@ -953,6 +953,11 @@ final class PreviewController {
         }
     }
 
+    /** The blueprint placed in the world now - the one the overlay paints; null when none is. */
+    Blueprint active() {
+        return activeBlueprint;
+    }
+
     /** The paste tool's clipboard, relative to its anchor and unturned; null when nothing is chosen. */
     private Clipboard clipboardHeld() {
         Blueprint bp = clipboard;
