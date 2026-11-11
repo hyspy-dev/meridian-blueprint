@@ -381,8 +381,10 @@ final class PreviewController {
     /** A prefab file, resolved to this connection's blocks and anchored at {@code (x, y, z)}. */
     private Optional<Loaded> resolvePrefab(Path prefabPath, int x, int y, int z) {
         Prefabs.Resolved resolved;
+        Prefabs.Prefab prefab;
         try {
-            resolved = prefabs.resolve(prefabs.read(prefabPath));
+            prefab = prefabs.read(prefabPath);
+            resolved = prefabs.resolve(prefab);
         } catch (IOException e) {
             log.warn("failed to read prefab {}", prefabPath, e);
             return Optional.empty();
@@ -390,8 +392,26 @@ final class PreviewController {
         if (!resolved.unknown().isEmpty()) {
             log.warn("skipped {} unique unknown block types: {}", resolved.unknown().size(), resolved.unknown());
         }
-        Blueprint bp = Blueprint.of(x, y, z, resolved.clipboard());
+        Blueprint bp = Blueprint.of(x, y, z, withAir(prefab, resolved.clipboard()));
         return bp.size == 0 ? Optional.empty() : Optional.of(new Loaded(bp, resolved.empty()));
+    }
+
+    /**
+     * The prefab's empty cells kept as cells of block 0 - air, where the blueprint wants nothing: the
+     * overlay paints a block there as wrong, and building breaks it. They go through the paste tool's
+     * turns with the rest, and are never drawn as a ghost.
+     */
+    private static Clipboard withAir(Prefabs.Prefab prefab, Clipboard clipboard) {
+        List<PastePreview.Change> blocks = new ArrayList<>(clipboard.blocks());
+        boolean any = false;
+        for (Prefabs.Cell c : prefab.blocks()) {
+            if (c.filler() == 0 && meridian.core.api.BlockView.EMPTY.equals(c.name())) {
+                blocks.add(new PastePreview.Change(c.x() - prefab.anchorX(), c.y() - prefab.anchorY(),
+                        c.z() - prefab.anchorZ(), 0, 0));
+                any = true;
+            }
+        }
+        return any ? new Clipboard(blocks, clipboard.fluids()) : clipboard;
     }
 
     /** Puts a prefab file into the paste tool - the prefab list's Load. */
@@ -1017,7 +1037,7 @@ final class PreviewController {
         List<PastePreview.Change> filtered = new ArrayList<>(bp.size);
         for (int i = 0; i < bp.size; i++) {
             int dy = bp.dy[i];
-            if (dy < lo || dy >= hi) continue;
+            if (dy < lo || dy >= hi || bp.blockId[i] == 0) continue;   // air: no ghost
             filtered.add(new PastePreview.Change(
                     bp.dx[i], dy, bp.dz[i], bp.blockId[i], bp.rotation[i]));
         }

@@ -154,7 +154,16 @@ final class DiffPainter {
                         bp.anchorY + dy,
                         bp.anchorZ + bp.dz[i]);
                 int actualId = actual != null && actual.type() != null ? actual.type().id() : 0;
-                if (actual == null || actual.isAir() || actualId <= 0) {
+                if (bp.blockId[i] == 0) {
+                    // Air in the blueprint: a block there, or a fluid, is in the way.
+                    boolean clear = (actual == null || actual.isAir() || actualId <= 0)
+                            && world.fluidCellAt(bp.anchorX + bp.dx[i], bp.anchorY + dy, bp.anchorZ + bp.dz[i]) == null;
+                    if (clear) {
+                        ns = CellState.CORRECT; correct++;
+                    } else {
+                        ns = CellState.WRONG; wrong++;
+                    }
+                } else if (actual == null || actual.isAir() || actualId <= 0) {
                     ns = CellState.MISSING; missing++;
                 } else if (!actual.matches(bp.blockId[i], actual.rotation())) {
                     // Another block - or a filler: a bigger block stands on another cell and only

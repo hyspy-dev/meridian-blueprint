@@ -215,6 +215,8 @@ public class BlueprintModule implements ProxyModule {
     private volatile meridian.core.api.BlockPos chest;
     private volatile String scaffold = "";
     private volatile String buildNote = "";
+    /** How many copies "Build along" makes; -1: until stopped. */
+    private volatile int copies = -1;
 
     private Construction.Options buildOptions() {
         return new Construction.Options(chests, chest, scaffold);
@@ -233,6 +235,8 @@ public class BlueprintModule implements ProxyModule {
             return null;
         }
         meridian.core.api.Containers containers = ctx.services().get(meridian.core.api.Containers.class).orElse(null);
+        movementRef = movement;
+        worldRef = world;
         Construction construction = new Construction(movement, world, worldState, worker, navigator,
                 ctx.services().get(meridian.core.api.PlayerState.class).orElse(null), containers, debug,
                 ctx.offloadExecutor(), ctx.getLogger());
@@ -258,6 +262,14 @@ public class BlueprintModule implements ProxyModule {
                     buildNote = "";
                     construction.build(preview.active(), buildOptions());
                 })
+                .int_("buildCopies", "Build along: how many copies (-1: until stopped)", -1, 1000, copies,
+                        v -> copies = v)
+                .button("Build along where I look", () -> {
+                    buildNote = "";
+                    Blueprint bp = preview.active();
+                    int[] step = step(bp, facing(movement));
+                    construction.buildAlong(bp, buildOptions(), step[0], step[1], copies);
+                })
                 .button("Stop building", () -> {
                     buildNote = "";
                     construction.cancel();
@@ -266,7 +278,34 @@ public class BlueprintModule implements ProxyModule {
                 .build();
     }
 
+    /** The axis the player looks along, as a unit step: x+, x-, z+ or z-. */
+    private static int[] facing(meridian.core.api.Movement movement) {
+        meridian.core.api.Movement.State st = movement.state();
+        double yaw = st == null ? 0 : st.yaw();
+        // yaw 0 looks to -z, a quarter turn to -x.
+        double lx = -Math.sin(yaw);
+        double lz = -Math.cos(yaw);
+        return Math.abs(lx) >= Math.abs(lz) ? new int[] {lx > 0 ? 1 : -1, 0} : new int[] {0, lz > 0 ? 1 : -1};
+    }
+
+    /** One copy further along the axis: the blueprint's own length that way. */
+    private static int[] step(Blueprint bp, int[] axis) {
+        if (bp == null || bp.size == 0) {
+            return new int[] {0, 0};
+        }
+        int min = Integer.MAX_VALUE;
+        int max = Integer.MIN_VALUE;
+        for (int i = 0; i < bp.size; i++) {
+            int v = axis[0] != 0 ? bp.dx[i] : bp.dz[i];
+            min = Math.min(min, v);
+            max = Math.max(max, v);
+        }
+        int len = max - min + 1;
+        return new int[] {axis[0] * len, axis[1] * len};
+    }
+
     private static final String BUILD_USAGE = "build | build-box <x y z> <w h d> <block> [rotation] | stop"
+            + " | build-along <copies> [x+|x-|z+|z-] | build-box-along <x y z> <w h d> <block> <copies> <x+|x-|z+|z->"
             + " | set chests off|nearest|chest <x y z> | set scaffold <item>";
 
     /** {@code blueprint <conn> build | build-box ... | stop | set ...}. */
@@ -304,7 +343,14 @@ public class BlueprintModule implements ProxyModule {
             case "build" -> {
                 return construction.build(preview.active(), buildOptions()).thenApply(BlueprintModule::result);
             }
-            case "build-box" -> {
+            case "build-along" -> {
+                Blueprint bp = preview.active();
+                int n = args.size() > 1 ? Integer.parseInt(args.get(1)) : -1;
+                int[] axis = args.size() > 2 ? axis(args.get(2)) : facing(movementOf(construction));
+                int[] st = step(bp, axis);
+                return construction.buildAlong(bp, buildOptions(), st[0], st[1], n).thenApply(BlueprintModule::result);
+            }
+            case "build-box", "build-box-along" -> {
                 // A box of one block, for checking the building without a prefab.
                 if (args.size() < 8) {
                     throw new IllegalArgumentException(BUILD_USAGE);
@@ -315,8 +361,10 @@ public class BlueprintModule implements ProxyModule {
                 int w = Integer.parseInt(args.get(4));
                 int h = Integer.parseInt(args.get(5));
                 int d = Integer.parseInt(args.get(6));
-                int id = worldState.blockId(args.get(7)).orElseThrow(() -> new IllegalArgumentException("no block " + args.get(7)));
-                int rot = args.size() > 8 ? Integer.parseInt(args.get(8)) : 0;
+                int fluid = worldRef == null ? -1 : worldRef.fluidId(args.get(7));
+                int id = fluid > 0 ? 0 : worldState.blockId(args.get(7))
+                        .orElseThrow(() -> new IllegalArgumentException("no block " + args.get(7)));
+                int rot = args.size() > 8 && what.equals("build-box") ? Integer.parseInt(args.get(8)) : 0;
                 int n = w * h * d;
                 int[] dx = new int[n], dy = new int[n], dz = new int[n], ids = new int[n];
                 byte[] rots = new byte[n];
@@ -333,8 +381,17 @@ public class BlueprintModule implements ProxyModule {
                         }
                     }
                 }
-                return construction.build(new Blueprint(x, y, z, dx, dy, dz, ids, rots), buildOptions())
-                        .thenApply(BlueprintModule::result);
+                // A fluid's name: a box of its source, no blocks.
+                Blueprint box = fluid > 0
+                        ? new Blueprint(x, y, z, new int[0], new int[0], new int[0], new int[0], new byte[0],
+                                new Blueprint.Fluids(dx, dy, dz, filled(n, fluid), new byte[n]))
+                        : new Blueprint(x, y, z, dx, dy, dz, ids, rots);
+                if (args.size() > 9 && what.equals("build-box-along")) {
+                    int many = Integer.parseInt(args.get(8));
+                    int[] st = step(box, axis(args.get(9)));
+                    return construction.buildAlong(box, buildOptions(), st[0], st[1], many).thenApply(BlueprintModule::result);
+                }
+                return construction.build(box, buildOptions()).thenApply(BlueprintModule::result);
             }
             default -> throw new IllegalArgumentException(BUILD_USAGE);
         }
@@ -348,7 +405,33 @@ public class BlueprintModule implements ProxyModule {
         out.put("scaffolds", r.scaffolds());
         out.put("left", r.left());
         out.put("lacking", r.lacking());
+        out.put("poured", r.poured());
+        out.put("copies", r.copies());
         return out;
+    }
+
+    private static int[] filled(int n, int v) {
+        int[] a = new int[n];
+        java.util.Arrays.fill(a, v);
+        return a;
+    }
+
+    private volatile World worldRef;
+
+    private static int[] axis(String s) {
+        return switch (s.toLowerCase(Locale.ROOT)) {
+            case "x+" -> new int[] {1, 0};
+            case "x-" -> new int[] {-1, 0};
+            case "z+" -> new int[] {0, 1};
+            case "z-" -> new int[] {0, -1};
+            default -> throw new IllegalArgumentException("an axis: x+, x-, z+ or z-");
+        };
+    }
+
+    private volatile meridian.core.api.Movement movementRef;
+
+    private meridian.core.api.Movement movementOf(Construction c) {
+        return movementRef;
     }
 
     private static void onPrefabClicked(ModuleContext ctx, PreviewController preview,
