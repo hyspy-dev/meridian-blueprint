@@ -85,6 +85,13 @@ public class BlueprintModule implements ProxyModule {
                 log, world, worldState, prefabs, debug, pastePreview, builderSelection);
 
         PrefabLibrary library = new PrefabLibrary(log, ctx.getDataDir());
+        libraryRef = library;
+        // The prefab put down, kept in the settings for the next session - a headless one builds on it.
+        SettingBinding<String> keptBinding = new SettingBinding<>();
+        preview.setKeeping(keptBinding::set, ctx.services().get(meridian.core.api.PlayerState.class).orElse(null));
+        // The blocks it takes, at the side of the screen while a blueprint is shown.
+        ctx.services().get(meridian.core.api.Hud.class).ifPresent(hud -> preview.setMaterials(new MaterialsHud(log, hud,
+                world, worldState, ctx.services().get(meridian.core.api.PlayerState.class).orElse(null))));
         // The paste tool's E opens the game's prefab list; core opens it over our prefabs instead
         // of the server's.
         preview.setLibrary(library);
@@ -129,6 +136,10 @@ public class BlueprintModule implements ProxyModule {
                                 : "Blueprinting (needs a 0.6+ server)",
                         false, on -> preview.setBlueprinting(on, scheduler))
                 .liveText("Status", preview::statusLine)
+                // The prefab put down, as the next session puts it down again: name | the paste tool's
+                // turns @x,y,z, then the panel's moves (s), turns (r) and mirrors (m).
+                .string("blueprintPutDown", "Put down (prefab | turns @x,y,z moves)", "", preview::setKept, keptBinding)
+                    .persistent()
                 .liveList("Prefabs (click to preview)",
                         library::rows,
                         idx -> onPrefabClicked(ctx, preview, library, idx))
@@ -241,7 +252,7 @@ public class BlueprintModule implements ProxyModule {
                 ctx.services().get(meridian.core.api.PlayerState.class).orElse(null), containers, debug,
                 ctx.offloadExecutor(), ctx.getLogger());
         try {
-            ctx.registerCommand("blueprint", BUILD_USAGE, (args, json) -> buildCommand(construction, preview, worldState, args));
+            ctx.registerCommand("blueprint", BUILD_USAGE, (args, json) -> buildCommand(ctx, construction, preview, worldState, args));
         } catch (NoSuchMethodError olderProxy) {
             // no command channel there
         }
@@ -258,17 +269,20 @@ public class BlueprintModule implements ProxyModule {
                 .liveText("Chest", () -> chest == null ? "None chosen." : chest.x() + " " + chest.y() + " " + chest.z())
                 .string("buildScaffold", "Scaffolding of (an item; empty: a cheap block carried)", "",
                         v -> scaffold = v == null ? "" : v.trim())
+                .button("Forget the prefab put down", preview::forgetPlaced)
                 .button("Build", () -> {
                     buildNote = "";
-                    construction.build(preview.active(), buildOptions());
+                    ctx.offloadExecutor().execute(() -> construction.build(preview.activeOrKept(ctx.scheduler()), buildOptions()));
                 })
                 .int_("buildCopies", "Build along: how many copies (-1: until stopped)", -1, 1000, copies,
                         v -> copies = v)
                 .button("Build along where I look", () -> {
                     buildNote = "";
-                    Blueprint bp = preview.active();
-                    int[] step = step(bp, facing(movement));
-                    construction.buildAlong(bp, buildOptions(), step[0], step[1], copies);
+                    ctx.offloadExecutor().execute(() -> {
+                        Blueprint bp = preview.activeOrKept(ctx.scheduler());
+                        int[] step = step(bp, facing(movement));
+                        construction.buildAlong(bp, buildOptions(), step[0], step[1], copies);
+                    });
                 })
                 .button("Stop building", () -> {
                     buildNote = "";
@@ -304,15 +318,107 @@ public class BlueprintModule implements ProxyModule {
         return new int[] {axis[0] * len, axis[1] * len};
     }
 
-    private static final String BUILD_USAGE = "build | build-box <x y z> <w h d> <block> [rotation] | stop"
+    private static final String BUILD_USAGE = "prefabs | put <prefab> <x y z> | turn|mirror X|Y|Z | move <dx dy dz>"
+            + " | build | placed | forget | build-box <x y z> <w h d> <block> [rotation] | stop"
             + " | build-along <copies> [x+|x-|z+|z-] | build-box-along <x y z> <w h d> <block> <copies> <x+|x-|z+|z->"
             + " | set chests off|nearest|chest <x y z> | set scaffold <item>";
 
     /** {@code blueprint <conn> build | build-box ... | stop | set ...}. */
-    private CompletableFuture<?> buildCommand(Construction construction, PreviewController preview,
+    private CompletableFuture<?> buildCommand(ModuleContext ctx, Construction construction, PreviewController preview,
                                               WorldState worldState, List<String> args) {
         String what = args.isEmpty() ? "" : args.get(0).toLowerCase(Locale.ROOT);
         switch (what) {
+            case "placed" -> {
+                return CompletableFuture.supplyAsync(() -> {
+                    Blueprint bp = preview.activeOrKept(ctx.scheduler());
+                    Map<String, Object> out = new LinkedHashMap<>();
+                    out.put("placed", preview.placedLine());
+                    if (bp != null) {
+                        out.put("at", List.of(bp.anchorX, bp.anchorY, bp.anchorZ));
+                        out.put("cells", bp.size);
+                        out.put("needed", Materials.needed(bp, worldState));
+                        if (bp.size <= 64) {
+                            // Each cell where it stands, its block and turn - to compare two sessions'.
+                            Map<Integer, String> names = new java.util.HashMap<>();
+                            worldState.allBlockTypes().forEach(t -> names.put(t.id(), t.name()));
+                            List<List<Object>> blocks = new java.util.ArrayList<>();
+                            for (int i = 0; i < bp.size; i++) {
+                                blocks.add(List.of(bp.anchorX + bp.dx[i], bp.anchorY + bp.dy[i], bp.anchorZ + bp.dz[i],
+                                        names.getOrDefault(bp.blockId[i], "#" + bp.blockId[i]), bp.rotation[i] & 0xFF));
+                            }
+                            out.put("blocks", blocks);
+                        }
+                    }
+                    return out;
+                }, ctx.offloadExecutor());
+            }
+            case "prefabs" -> {
+                PrefabLibrary lib = libraryRef;
+                Map<String, Object> out = new LinkedHashMap<>();
+                if (lib != null) {
+                    lib.refresh();
+                    out.put("names", lib.names());
+                }
+                out.put("dir", ctx.getDataDir().toAbsolutePath().toString());
+                return CompletableFuture.completedFuture(out);
+            }
+            case "put" -> {
+                if (args.size() < 5) {
+                    throw new IllegalArgumentException(BUILD_USAGE);
+                }
+                PrefabLibrary lib = libraryRef;
+                String name = args.get(1);
+                int x = Integer.parseInt(args.get(2));
+                int y = Integer.parseInt(args.get(3));
+                int z = Integer.parseInt(args.get(4));
+                return CompletableFuture.supplyAsync(() -> {
+                    if (lib == null) {
+                        throw new IllegalStateException("no prefab library");
+                    }
+                    lib.refresh();
+                    java.nio.file.Path path = lib.pathOf(name)
+                            .orElseThrow(() -> new IllegalArgumentException("no prefab " + name + " - see: prefabs"));
+                    Blueprint bp = preview.putDown(ctx.scheduler(), path, x, y, z);
+                    if (bp == null) {
+                        throw new IllegalArgumentException("prefab " + name + " has no block this game knows");
+                    }
+                    Map<String, Object> out = new LinkedHashMap<>();
+                    out.put("placed", name);
+                    out.put("cells", bp.size);
+                    out.put("needed", Materials.needed(bp, worldState));
+                    return out;
+                }, ctx.offloadExecutor());
+            }
+            case "turn", "mirror" -> {
+                if (args.size() < 2) {
+                    throw new IllegalArgumentException(BUILD_USAGE);
+                }
+                int axis = BuilderSelection.Axis.valueOf(args.get(1).toUpperCase(Locale.ROOT)).ordinal();
+                return CompletableFuture.supplyAsync(() -> {
+                    if (what.equals("turn")) {
+                        preview.rotatePreview(axis);
+                    } else {
+                        preview.mirrorPreview(axis);
+                    }
+                    return Map.of("placed", preview.placedLine());
+                }, ctx.offloadExecutor());
+            }
+            case "move" -> {
+                if (args.size() < 4) {
+                    throw new IllegalArgumentException(BUILD_USAGE);
+                }
+                int dx = Integer.parseInt(args.get(1));
+                int dy = Integer.parseInt(args.get(2));
+                int dz = Integer.parseInt(args.get(3));
+                return CompletableFuture.supplyAsync(() -> {
+                    preview.shiftPreview(dx, dy, dz);
+                    return Map.of("placed", preview.placedLine());
+                }, ctx.offloadExecutor());
+            }
+            case "forget" -> {
+                preview.forgetPlaced();
+                return CompletableFuture.completedFuture(Map.of("forgotten", true));
+            }
             case "stop" -> {
                 return construction.cancel().thenApply(v -> Map.of("stopped", true));
             }
@@ -341,14 +447,17 @@ public class BlueprintModule implements ProxyModule {
                 return CompletableFuture.completedFuture(out);
             }
             case "build" -> {
-                return construction.build(preview.active(), buildOptions()).thenApply(BlueprintModule::result);
+                return CompletableFuture.supplyAsync(() -> preview.activeOrKept(ctx.scheduler()), ctx.offloadExecutor())
+                        .thenCompose(bp -> construction.build(bp, buildOptions())).thenApply(BlueprintModule::result);
             }
             case "build-along" -> {
-                Blueprint bp = preview.active();
                 int n = args.size() > 1 ? Integer.parseInt(args.get(1)) : -1;
                 int[] axis = args.size() > 2 ? axis(args.get(2)) : facing(movementOf(construction));
-                int[] st = step(bp, axis);
-                return construction.buildAlong(bp, buildOptions(), st[0], st[1], n).thenApply(BlueprintModule::result);
+                return CompletableFuture.supplyAsync(() -> preview.activeOrKept(ctx.scheduler()), ctx.offloadExecutor())
+                        .thenCompose(bp -> {
+                            int[] st = step(bp, axis);
+                            return construction.buildAlong(bp, buildOptions(), st[0], st[1], n);
+                        }).thenApply(BlueprintModule::result);
             }
             case "build-box", "build-box-along" -> {
                 // A box of one block, for checking the building without a prefab.
@@ -417,6 +526,7 @@ public class BlueprintModule implements ProxyModule {
     }
 
     private volatile World worldRef;
+    private volatile PrefabLibrary libraryRef;
 
     private static int[] axis(String s) {
         return switch (s.toLowerCase(Locale.ROOT)) {

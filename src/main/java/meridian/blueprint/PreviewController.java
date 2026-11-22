@@ -187,6 +187,223 @@ final class PreviewController {
         this.builderSelection = builderSelection;
     }
 
+    /** What the player carries; null where core does not tell. */
+    private volatile meridian.core.api.PlayerState inventory;
+    /** The prefab in the paste tool, by name; empty for a selection copied into it. */
+    private volatile String clipboardName = "";
+    /** The paste tool's turns and flips since its clipboard was handed over, as it told them. */
+    private final List<String> toolTurns = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /**
+     * The prefab put down, as the setting keeps it: {@code name | <the paste tool's turns> @x,y,z <the
+     * panel's moves and turns after>} - all it takes to put it down again: the prefab read anew and
+     * turned by the same turns.
+     */
+    private volatile String kept = "";
+    /** Whether the blueprint shown is the one {@link #kept} - the panel's moves of it are added to it. */
+    private volatile boolean shownIsKept;
+    /** Where the kept line goes: the setting. */
+    private volatile java.util.function.Consumer<String> publish = line -> { };
+
+    void setKeeping(java.util.function.Consumer<String> publish, meridian.core.api.PlayerState inventory) {
+        this.publish = publish == null ? line -> { } : publish;
+        this.inventory = inventory;
+    }
+
+    /** The panel of blocks at the side of the screen while a blueprint is shown; null where there is no HUD. */
+    private volatile MaterialsHud materials;
+    /** The scheduler the shown blueprint ticks on - the panel's too. */
+    private volatile Scheduler shownScheduler;
+
+    void setMaterials(MaterialsHud materials) {
+        this.materials = materials;
+    }
+
+    /** The panel's title: the prefab put down, by name. */
+    private String panelTitle() {
+        String k = kept;
+        int bar = k.indexOf(" | ");
+        return shownIsKept && bar > 0 ? k.substring(0, bar) : "Blueprint";
+    }
+
+    /** The panel shown for {@code bp} - where a game is there to see it. */
+    private void showMaterials(Blueprint bp) {
+        MaterialsHud m = materials;
+        Scheduler s = shownScheduler;
+        if (m != null && s != null && bp != null && pastePreview.isAvailable()) {
+            m.start(bp, this::panelTitle, s);
+        }
+    }
+
+    /**
+     * The lines handed to the setting lately. The panel applies a value later, on its own thread, and
+     * calls {@link #setKept} back with it: an echo of an older one - the {@code put} before a {@code
+     * turn} - overwrote the newer line, and the turn was lost (stand, 22.11).
+     */
+    private final java.util.Deque<String> published = new java.util.ArrayDeque<>();
+
+    /** The setting's value: at the start, and when the player edits the field. */
+    void setKept(String line) {
+        String v = line == null ? "" : line.trim();
+        synchronized (published) {
+            if (published.contains(v)) {
+                return;         // our own line coming back from the panel
+            }
+        }
+        kept = v;
+    }
+
+    private void putKept(String line) {
+        synchronized (published) {
+            published.addLast(line);
+            while (published.size() > 32) {
+                published.removeFirst();
+            }
+        }
+        kept = line;
+        publish.accept(line);
+    }
+
+    /** A move or turn of the panel, of the blueprint put down: added to the kept line. */
+    private void keptMoved(String op) {
+        String k = kept;
+        if (shownIsKept && !k.isEmpty()) {
+            putKept(k + " " + op);
+        }
+    }
+
+    /** A prefab file's name without its {@code .prefab.json}. */
+    private static String prefabName(Path path) {
+        String n = path.getFileName().toString();
+        return n.endsWith(".prefab.json") ? n.substring(0, n.length() - ".prefab.json".length()) : n;
+    }
+
+    /**
+     * The blueprint put down now - or, none being, the kept one put down again: shown where a game
+     * is there to show it to, else (a headless session) only taken as the one to build. Null when
+     * there is neither. Reads the prefab: off the network thread.
+     */
+    Blueprint activeOrKept(Scheduler scheduler) {
+        Blueprint now = activeBlueprint;
+        if (now != null) {
+            return now;
+        }
+        String line = kept;
+        Blueprint bp = line.isEmpty() ? null : putAgain(line);
+        if (bp == null) {
+            return null;
+        }
+        if (scheduler != null && pastePreview.isAvailable()) {
+            startBlueprint(scheduler, bp, "put down again: " + line);
+        } else {
+            activeBlueprint = bp;
+            log.info("put down again: {} ({} cells at {},{},{})", line, bp.size, bp.anchorX, bp.anchorY, bp.anchorZ);
+        }
+        shownIsKept = true;
+        return bp;
+    }
+
+    /**
+     * A kept line put down again: the prefab read from the library, turned by the paste tool's turns
+     * the way the paste tool turns (core's own), anchored where it was pasted, then moved and turned
+     * as the panel did. Null - and logged - when the prefab is not there or the line is not one.
+     */
+    private Blueprint putAgain(String line) {
+        int bar = line.indexOf(" | ");
+        PrefabLibrary lib = library;
+        if (bar <= 0 || lib == null) {
+            log.warn("the prefab put down cannot be put down again: '{}'", line);
+            return null;
+        }
+        String name = line.substring(0, bar).trim();
+        lib.refresh();
+        Path path = lib.pathOf(name).orElse(null);
+        Blueprint base = path == null ? null : readPrefab(path).orElse(null);
+        if (base == null) {
+            log.warn("the prefab put down, {}, is not among the prefabs (or has no block this game knows)", name);
+            return null;
+        }
+        try {
+            Clipboard clip = base.toClipboard();
+            Blueprint bp = null;
+            for (String t : line.substring(bar + 3).trim().split("\\s+")) {
+                if (t.isEmpty()) {
+                    continue;
+                }
+                char k = t.charAt(0);
+                if (k == '@') {
+                    int[] at = ints(t.substring(1));
+                    bp = Blueprint.of(at[0], at[1], at[2], clip);
+                } else if (bp == null && k == 'F') {
+                    BuilderSelection.Axis axis = BuilderSelection.Axis.valueOf(t.substring(1));
+                    clip = builderSelection != null ? builderSelection.flippedAsTool(clip, axis)
+                            : clip.flipped(axis.ordinal(), flipTypes());
+                } else if (bp == null) {
+                    BuilderSelection.Axis axis = BuilderSelection.Axis.valueOf(t.substring(0, 1));
+                    int degrees = Integer.parseInt(t.substring(1));
+                    clip = builderSelection != null ? builderSelection.turnedAsTool(clip, axis, degrees)
+                            : clip.turned(axis.ordinal(), degrees / 90);
+                } else if (k == 'r' || k == 'm') {
+                    bp = transformed(bp, BuilderSelection.Axis.valueOf(t.substring(1)).ordinal(), k == 'm');
+                } else if (k == 's') {
+                    int[] d = ints(t.substring(1));
+                    bp = shifted(bp, d[0], d[1], d[2]);
+                } else {
+                    throw new IllegalArgumentException("'" + t + "'");
+                }
+            }
+            if (bp == null) {
+                throw new IllegalArgumentException("no @x,y,z");
+            }
+            return bp;
+        } catch (RuntimeException e) {
+            log.warn("the prefab put down cannot be put down again: '{}' - {}", line, e.toString());
+            return null;
+        }
+    }
+
+    private static int[] ints(String csv) {
+        String[] p = csv.split(",");
+        if (p.length != 3) {
+            throw new IllegalArgumentException("'" + csv + "' is not x,y,z");
+        }
+        return new int[] {Integer.parseInt(p[0].trim()), Integer.parseInt(p[1].trim()), Integer.parseInt(p[2].trim())};
+    }
+
+    /**
+     * Puts a prefab file down with its anchor at {@code (x, y, z)}, unturned - the paste tool's paste
+     * without the paste tool, for a session with no game behind it - and keeps it. Null when the
+     * prefab has no block this connection knows. Reads a file: off the network thread.
+     */
+    Blueprint putDown(Scheduler scheduler, Path prefabPath, int x, int y, int z) {
+        Blueprint bp = resolvePrefab(prefabPath, x, y, z).map(Loaded::blueprint).orElse(null);
+        if (bp == null) {
+            return null;
+        }
+        String name = prefabName(prefabPath);
+        if (scheduler != null && pastePreview.isAvailable()) {
+            startBlueprint(scheduler, bp, name + " put at " + x + "," + y + "," + z);
+        } else {
+            hide();
+            activeBlueprint = bp;
+            log.info("{} put at {},{},{} ({} cells)", name, x, y, z, bp.size);
+        }
+        putKept(name + " | @" + x + "," + y + "," + z);
+        shownIsKept = true;
+        return bp;
+    }
+
+    /** The kept line, or "None.". */
+    String placedLine() {
+        String k = kept;
+        return k.isEmpty() ? "None." : k;
+    }
+
+    /** Forgets the prefab put down; what is shown stays until hidden. */
+    void forgetPlaced() {
+        shownIsKept = false;
+        putKept("");
+    }
+
     /** Whether the native in-game selection tool can be offered - the 0.6 line and later. */
     boolean hasBuilderTools() {
         return builderSelection != null;
@@ -225,9 +442,11 @@ final class PreviewController {
             // we hear where it was pasted, and the clipboard as the tool held it then.
             builderSelection.onPaste(new BuilderSelection.PasteListener() {
                 @Override public void turned(BuilderSelection.Axis axis, int degrees) {
+                    toolTurns.add(axis.name() + degrees);
                     log.info("paste tool turned {} by {}", axis, degrees);
                 }
                 @Override public void flipped(BuilderSelection.Axis axis) {
+                    toolTurns.add("F" + axis.name());
                     log.info("paste tool flipped across {}", axis);
                 }
                 @Override public void copyAsked() {
@@ -237,6 +456,7 @@ final class PreviewController {
                     openPrefabList();
                 }
                 @Override public void reset() {
+                    toolTurns.clear();
                     log.info("paste tool turns reset");
                 }
                 @Override public void pasted(int x, int y, int z, Clipboard turned) {
@@ -246,7 +466,11 @@ final class PreviewController {
             builderSelection.defineTools(TOOL_SPECS);   // teach the client our items
             toolsWired = true;
         }
+        toolTurns.clear();                          // core hands the clipboard over unturned
         builderSelection.setClipboard(on ? clipboardHeld() : null);
+        if (on && activeBlueprint == null && !kept.isEmpty()) {
+            scheduler.schedule(() -> activeOrKept(scheduler), Duration.ZERO);   // the one put down before, shown again
+        }
         builderSelection.forceTools(on
                 ? List.of(
                         BuilderSelection.SELECTION_TOOL,   // slot 0: outline a selection
@@ -422,6 +646,7 @@ final class PreviewController {
             return;
         }
         String label = prefabPath.getFileName() + " (" + bp.get().size + " blocks)";
+        clipboardName = prefabName(prefabPath);
         if (!loadIntoPasteTool(bp.get(), label)) {
             log.info("{} not loaded - blueprinting is off", label);
         }
@@ -443,10 +668,13 @@ final class PreviewController {
         Blueprint bp = loaded.get().blueprint();
         String label = prefabPath.getFileName() + " (" + bp.size + " blocks, "
                 + loaded.get().skippedEmpty() + " Empty skipped)";
+        clipboardName = prefabName(prefabPath);
         if (loadIntoPasteTool(bp, label)) {
             return;
         }
         startBlueprint(scheduler, bp, label);
+        putKept(clipboardName + " | @" + ox + "," + oy + "," + oz);
+        shownIsKept = true;
     }
 
     /**
@@ -466,6 +694,10 @@ final class PreviewController {
         }
         painter = null;
         activeBlueprint = null;
+        MaterialsHud m = materials;
+        if (m != null) {
+            m.stop();
+        }
         if (p != null) {
             log.info("preview cleared");
         }
@@ -708,6 +940,7 @@ final class PreviewController {
         }
         String label = "selection (" + i + "/" + volume + " blocks, "
                 + b.sizeX() + "x" + b.sizeY() + "x" + b.sizeZ() + ")";
+        clipboardName = "";
         if (loadIntoPasteTool(bp, label)) {
             return;
         }
@@ -773,9 +1006,13 @@ final class PreviewController {
         }
         if (dx == 0 && dy == 0 && dz == 0) return;
 
-        swapInBlueprint(new Blueprint(
-                bp.anchorX + dx, bp.anchorY + dy, bp.anchorZ + dz,
-                bp.dx, bp.dy, bp.dz, bp.blockId, bp.rotation, bp.fluids));
+        swapInBlueprint(shifted(bp, dx, dy, dz));
+        keptMoved("s" + dx + "," + dy + "," + dz);
+    }
+
+    private static Blueprint shifted(Blueprint bp, int dx, int dy, int dz) {
+        return new Blueprint(bp.anchorX + dx, bp.anchorY + dy, bp.anchorZ + dz,
+                bp.dx, bp.dy, bp.dz, bp.blockId, bp.rotation, bp.fluids);
     }
 
     /**
@@ -810,7 +1047,16 @@ final class PreviewController {
             return;
         }
         if (axis < Rotation.X || axis > Rotation.Z) return;
+        swapInBlueprint(transformed(bp, axis, mirror));
+        keptMoved((mirror ? "m" : "r") + BuilderSelection.Axis.values()[axis].name());
+    }
 
+    /**
+     * {@code bp} turned a quarter about {@code axis} (or mirrored across it), cells back to
+     * non-negative offsets, the difference folded into the anchor - nothing moves in the world but the
+     * cells about the anchor.
+     */
+    private Blueprint transformed(Blueprint bp, int axis, boolean mirror) {
         Clipboard c = bp.toClipboard();
         c = mirror ? c.flipped(axis, flipTypes()) : c.turned(axis, 1);
         // Back to non-negative offsets, the difference folded into the anchor, so nothing moves in
@@ -835,8 +1081,7 @@ final class PreviewController {
             fluids.add(new PastePreview.FluidChange(f.dx() - minX, f.dy() - minY, f.dz() - minZ, f.fluidId(),
                     f.level()));
         }
-        swapInBlueprint(Blueprint.of(bp.anchorX + minX, bp.anchorY + minY, bp.anchorZ + minZ,
-                new Clipboard(blocks, fluids)));
+        return Blueprint.of(bp.anchorX + minX, bp.anchorY + minY, bp.anchorZ + minZ, new Clipboard(blocks, fluids));
     }
 
     /** Each block's flip type by id, as core read it from the game's files. */
@@ -853,7 +1098,10 @@ final class PreviewController {
      *  preview. Shared tail for shift / rotate / mirror. */
     private void swapInBlueprint(Blueprint newBp) {
         DiffPainter oldPainter = painter;
-        if (oldPainter == null) return;
+        if (oldPainter == null) {
+            activeBlueprint = newBp;    // nothing drawn (a headless session): the blueprint to build moves all the same
+            return;
+        }
 
         DiffPainter p = new DiffPainter(log, world, debug, newBp);
         if (windowSize > 0) {
@@ -868,6 +1116,7 @@ final class PreviewController {
         pastePreview.hide();
         sendPastePreview(newBp, p.windowLo(), p.windowHi());
         p.tick();
+        showMaterials(newBp);
     }
 
     // ------------------------------------------------------------------
@@ -903,6 +1152,7 @@ final class PreviewController {
 
     private void startBlueprint(Scheduler scheduler, Blueprint bp, String label) {
         hide();
+        shownIsKept = false;            // the callers that put the kept one down say so after
         DiffPainter p = new DiffPainter(log, world, debug, bp);
         // Start with the previously-chosen layer/window if they still make
         // sense; otherwise default to "show everything from the bottom".
@@ -918,6 +1168,8 @@ final class PreviewController {
         p.tick();                                          // first frame, no waiting
         tickHandle = scheduler.scheduleAtFixedRate(this::tickIfActive,
                 DIFF_TICK, DIFF_TICK);
+        shownScheduler = scheduler;
+        showMaterials(bp);
         log.info("preview started: {} at {},{},{}",
                 label, bp.anchorX, bp.anchorY, bp.anchorZ);
     }
@@ -968,6 +1220,7 @@ final class PreviewController {
     /** Makes {@code bp} what the paste tool holds, unturned, and hands it over if the tools are up. */
     private void loadClipboard(Blueprint bp) {
         clipboard = bp;
+        toolTurns.clear();
         if (builderSelection != null && blueprinting) {
             builderSelection.setClipboard(clipboardHeld());
         }
@@ -999,8 +1252,15 @@ final class PreviewController {
         Blueprint placed = Blueprint.of(x, y, z, turned);
         log.info("paste tool pasted at {},{},{}", x, y, z);
         // Off the network thread: the first scan of a big blueprint reads every one of its blocks.
-        scheduler.schedule(() -> startBlueprint(scheduler, placed, "pasted at " + x + "," + y + "," + z),
-                Duration.ZERO);
+        // Kept as the prefab's name, the turns the tool told and where: put down again from those.
+        String name = clipboardName;
+        String line = name.isEmpty() ? "" : (name + " | " + String.join(" ", toolTurns) + " @" + x + "," + y + "," + z)
+                .replace("|  @", "| @");
+        scheduler.schedule(() -> {
+            startBlueprint(scheduler, placed, "pasted at " + x + "," + y + "," + z);
+            putKept(line);              // a selection pasted is no prefab: nothing kept
+            shownIsKept = !line.isEmpty();
+        }, Duration.ZERO);
     }
 
     /**

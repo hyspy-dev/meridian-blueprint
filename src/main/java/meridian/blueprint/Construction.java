@@ -78,8 +78,6 @@ final class Construction {
     /** Blocks scaffolding is made of, cheapest first, when none is chosen: those the player carries. */
     static final List<String> CHEAP = List.of("Soil_Dirt", "Rock_Stone_Cobble", "Rock_Stone", "Soil_Grass",
             "Rock_Sandstone", "Wood_Oak_Planks");
-    /** The tallest scaffold column under a block: its blocks go in from below. */
-    static final int COLUMN_MOST = 6;
     /** The tallest pillar to stand on: it is taken down under the feet. */
     static final int PILLAR_MOST = 24;
     /** From a pillar's top, blocks within this of the eyes are placed before it comes down. */
@@ -273,6 +271,8 @@ final class Construction {
         Set<BlockPos> skipped = new HashSet<>();
         Map<BlockPos, Integer> tries = new HashMap<>();
         Map<String, Integer> lacking = new LinkedHashMap<>();
+        // The character's pillars it climbed to blocks that hang in the air: it comes down them at the end.
+        List<BlockPos[]> standing = new ArrayList<>();
         Worker.Access inBox = Worker.Access.inside(box);
 
         // 1. What is in the way, top down: broken; a fluid where air goes shut out with scaffolding.
@@ -321,12 +321,14 @@ final class Construction {
             }
             Cell next = choose(pending);
             if (next == null) {
-                // Nothing left with something to lean on: a column of scaffolding under the lowest.
-                Cell lowest = pending.stream().min(Comparator.comparingInt((Cell c) -> c.pos().y())
-                        .thenComparingDouble(c -> distance(c.pos()))).orElseThrow();
-                status = pr.line("a column under " + text(lowest.pos()));
-                if (!support(id, lowest.pos(), byPos, scaffolds, o, cells)) {
-                    skipped.add(lowest.pos());
+                // Nothing left with something to lean on - the lowest hangs in the air: the character
+                // climbs its own pillar beside one of them, and the first block leans on the pillar's top.
+                if (!climbBeside(id, pending, byPos, o, pr, lacking, skipped, cells, standing)) {
+                    int lowest = pending.stream().mapToInt(c -> c.pos().y()).min().orElse(0);
+                    long left = pending.stream().filter(c -> c.pos().y() == lowest).count();
+                    log.info("blueprint: {} block(s) at y {} hang in the air with no place beside them to climb to"
+                            + " (ground within {} below, room for the body) - left", left, lowest, PILLAR_MOST);
+                    pending.stream().filter(c -> c.pos().y() == lowest).forEach(c -> skipped.add(c.pos()));
                 }
                 continue;
             }
@@ -359,7 +361,11 @@ final class Construction {
             pour(id, bp, pr, lacking);
         }
 
-        // 4. The scaffolding down, top first; then what was broken picked up.
+        // 4. Down the character's own pillars, the last climbed first; the scaffolding down, top first;
+        // then what was broken picked up.
+        for (int i = standing.size() - 1; i >= 0 && live(id); i--) {
+            comeDown(id, standing.get(i), pr);
+        }
         List<BlockPos> down = new ArrayList<>(scaffolds);
         down.sort(Comparator.comparingInt((BlockPos p) -> -p.y()));
         for (BlockPos p : down) {
@@ -508,17 +514,20 @@ final class Construction {
     }
 
     /**
-     * The next block to place: of those with something to lean on, the lowest layer first, and in it
-     * the nearest to the body.
+     * The next block to place: strictly layer by layer (owner, 22.11: "from the lowest to the upper") -
+     * only the lowest layer still to build, and in it the nearest to the body that has something to
+     * lean on. {@code null} when none of that layer has: it hangs, and the character climbs to it - a
+     * layer above is never begun before.
      */
     private Cell choose(List<Cell> pending) {
+        int layer = pending.stream().mapToInt(c -> c.pos().y()).min().orElse(Integer.MIN_VALUE);
         Cell best = null;
         double bestCost = Double.MAX_VALUE;
         for (Cell c : pending) {
-            if (!supported(c.pos())) {
+            if (c.pos().y() != layer || !supported(c.pos())) {
                 continue;
             }
-            double cost = c.pos().y() * 1000.0 + distance(c.pos());
+            double cost = distance(c.pos());
             if (cost < bestCost) {
                 bestCost = cost;
                 best = c;
@@ -551,43 +560,138 @@ final class Construction {
     }
 
     /**
-     * A column of scaffolding under the cell, from the first block below it up to just under it, so
-     * the cell has something to lean on. {@code false} when it is too tall, or a block of it would
-     * not go in.
+     * The character's own scaffolding up to blocks that hang in the air: a pillar built under the feet
+     * beside one of the lowest of them - outside the building - its top block level with that block,
+     * so the block leans on the pillar's side. From up there every block within reach that has
+     * something to lean on goes in; the pillar stays for the body to stand on and to come down by
+     * ({@link #comeDown}, at the end). The nearest such place first.
+     *
+     * @return whether a block went in from it
      */
-    private boolean support(int id, BlockPos cell, Map<BlockPos, Cell> byPos, Set<BlockPos> scaffolds, Options o,
-                            List<Cell> cells) throws Exception {
-        int ground = cell.y() - 1;
-        while (ground > cell.y() - 1 - COLUMN_MOST - 1 && world.known(cell.x(), ground, cell.z())
-                && world.blockAt(cell.x(), ground, cell.z()).isAir()) {
-            ground--;
-        }
-        if (cell.y() - 1 - ground > COLUMN_MOST || world.blockAt(cell.x(), ground, cell.z()).isAir()) {
-            return false;
-        }
+    private boolean climbBeside(int id, List<Cell> pending, Map<BlockPos, Cell> byPos, Options o, Progress pr,
+                                Map<String, Integer> lacking, Set<BlockPos> skipped, List<Cell> cells,
+                                List<BlockPos[]> standing) throws Exception {
         String item = scaffoldItem(o);
         if (item == null) {
             return false;
         }
-        for (int y = ground + 1; y < cell.y(); y++) {
-            if (!live(id)) {
-                return false;
+        int lowest = pending.stream().mapToInt(c -> c.pos().y()).min().orElse(Integer.MIN_VALUE);
+        BlockPos base = null;
+        Cell target = null;
+        int height = 0;
+        double best = Double.MAX_VALUE;
+        int[][] sides = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (Cell c : pending) {
+            if (c.pos().y() != lowest || skipped.contains(c.pos())) {
+                continue;
             }
-            BlockPos p = new BlockPos(cell.x(), y, cell.z());
-            Cell own = byPos.get(p);
-            if (own != null && !own.air() && state(own) == State.MISSING) {
-                continue;                     // one of the blueprint's: it goes in on its own turn
-            }
-            mark(p);
-            Worker.Outcome out = worker.place(p, item, -1).get(5, TimeUnit.MINUTES);
-            if (out == Worker.Outcome.PLACED) {
-                scaffolds.add(p);
-            } else if (out != Worker.Outcome.OCCUPIED) {
-                log.info("blueprint: the column under {} stopped at {} ({})", text(cell), text(p), out);
-                return false;
+            for (int[] d : sides) {
+                int x = c.pos().x() + d[0];
+                int z = c.pos().z() + d[1];
+                if (byPos.containsKey(new BlockPos(x, c.pos().y(), z))) {
+                    continue;                   // the building's own cell: the pillar stands outside it
+                }
+                for (int y = c.pos().y(); y >= c.pos().y() - PILLAR_MOST; y--) {
+                    BlockPos at = new BlockPos(x, y, z);
+                    if (!world.known(x, y, z)) {
+                        break;
+                    }
+                    if (world.standAt(at).isEmpty()) {
+                        if (!world.blockAt(x, y, z).isAir()) {
+                            break;              // something solid in the way down: no ground for it here
+                        }
+                        continue;
+                    }
+                    // Feet at y; the top block, under the feet at the end, level with the block.
+                    int h = c.pos().y() - y + 1;
+                    boolean clear = h >= 1 && h <= PILLAR_MOST;
+                    for (int k = 0; clear && k <= h + 1; k++) {
+                        BlockPos cc = new BlockPos(x, y + k, z);
+                        clear = !byPos.containsKey(cc) && world.blockAt(cc.x(), cc.y(), cc.z()).isAir();
+                    }
+                    double cost = distance(at) + h;
+                    if (clear && cost < best) {
+                        best = cost;
+                        base = at;
+                        target = c;
+                        height = h;
+                    }
+                    break;
+                }
             }
         }
-        return true;
+        if (base == null) {
+            return false;
+        }
+        status = pr.line("climbing a pillar of " + height + " at " + text(base) + " to " + text(target.pos()));
+        log.info("blueprint: {} hangs in the air - a pillar of {} at {} to climb to it", text(target.pos()), height,
+                text(base));
+        NavResult r = navigator.goTo(Goal.at(base)).get(3, TimeUnit.MINUTES);
+        if (!live(id) || r.status() != NavResult.Status.ARRIVED) {
+            log.info("blueprint: the way to {} to climb from: {}", text(base), r.status());
+            return false;
+        }
+        Worker.Outcome up = worker.pillarUp(item, height).get(2, TimeUnit.MINUTES);
+        Vec3 now = movement.position();
+        int built = now == null ? 0 : Math.max(0, (int) Math.floor(now.y() + 1e-3) - base.y());
+        if (built > 0) {
+            standing.add(new BlockPos[] {base, new BlockPos(base.x(), base.y() + built, base.z())});
+        }
+        if (up != Worker.Outcome.PLACED) {
+            log.info("blueprint: the pillar at {} stopped at {} of {} ({})", text(base), built, height, up);
+            return false;
+        }
+        // Every block of this layer within reach from up here that has something to lean on, the target
+        // first - the layers above wait for this one.
+        List<Cell> near = new ArrayList<>();
+        for (Cell c : cells) {
+            if (!c.air() && c.pos().y() == lowest && !skipped.contains(c.pos()) && state(c) == State.MISSING
+                    && fromEyes(c.pos()) <= FROM_PILLAR) {
+                near.add(c);
+            }
+        }
+        Cell first = target;
+        near.sort(Comparator.comparingInt((Cell c) -> c == first ? 0 : 1).thenComparingInt((Cell c) -> c.pos().y())
+                .thenComparingDouble(c -> fromEyes(c.pos())));
+        boolean placed = false;
+        boolean more = true;
+        while (more && live(id)) {
+            more = false;
+            for (Cell c : near) {
+                if (state(c) != State.MISSING || !supported(c.pos())) {
+                    continue;
+                }
+                if (placeCell(id, c, near, o, pr, lacking, skipped) == Worker.Outcome.PLACED) {
+                    more = true;
+                    placed = true;
+                }
+            }
+        }
+        return placed;
+    }
+
+    /**
+     * Down a pillar the character climbed: to its top - from the building, where the body is - and
+     * down it, its blocks broken under the feet. Left standing, and said so, when its top cannot be
+     * got to.
+     */
+    private void comeDown(int id, BlockPos[] pillar, Progress pr) throws Exception {
+        BlockPos base = pillar[0];
+        BlockPos top = pillar[1];
+        int blocks = top.y() - base.y();
+        if (blocks <= 0 || world.blockAt(base.x(), top.y() - 1, base.z()).isAir()) {
+            return;
+        }
+        status = pr.line("coming down the pillar at " + text(base));
+        NavResult r = navigator.goTo(Goal.at(top)).get(3, TimeUnit.MINUTES);
+        if (!live(id) || r.status() != NavResult.Status.ARRIVED) {
+            log.info("blueprint: the pillar at {} is left standing - its top not got to ({})", text(base), r.status());
+            return;
+        }
+        Worker.Outcome down = worker.pillarDown(blocks).get(3, TimeUnit.MINUTES);
+        if (down != Worker.Outcome.BROKEN) {
+            log.info("blueprint: coming down the pillar at {}: {}", text(base), down);
+        }
     }
 
     /**
@@ -643,10 +747,11 @@ final class Construction {
         Worker.Outcome up = worker.pillarUp(item, height).get(2, TimeUnit.MINUTES);
         boolean placed = false;
         if (up == Worker.Outcome.PLACED) {
-            // Every block within reach from up here, nearest the cell first.
+            // Every block of the cell's layer within reach from up here, nearest the cell first.
             List<Cell> near = new ArrayList<>();
             for (Cell c : cells) {
-                if (!c.air() && !skipped.contains(c.pos()) && state(c) == State.MISSING && fromEyes(c.pos()) <= FROM_PILLAR) {
+                if (!c.air() && c.pos().y() == cell.y() && !skipped.contains(c.pos()) && state(c) == State.MISSING
+                        && fromEyes(c.pos()) <= FROM_PILLAR) {
                     near.add(c);
                 }
             }
